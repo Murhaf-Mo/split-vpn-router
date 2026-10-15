@@ -15,9 +15,17 @@ IMAGE = os.environ.get("VPN_CONTAINER_IMAGE")
 
 
 def available_port():
-    with socket.socket() as stream:
-        stream.bind(("127.0.0.1", 0))
-        return stream.getsockname()[1]
+    # Windows may reserve different ranges for TCP and UDP (Hyper-V/Docker).
+    for _ in range(100):
+        with socket.socket() as stream, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+            stream.bind(("127.0.0.1", 0))
+            port = stream.getsockname()[1]
+            try:
+                datagram.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("No free TCP/UDP test port")
 
 
 @unittest.skipUnless(IMAGE, "Set VPN_CONTAINER_IMAGE to test a built Docker image")
@@ -58,7 +66,6 @@ class ContainerTests(unittest.TestCase):
                     except OSError:
                         time.sleep(.2)
                 self.fail("Container control API did not become ready")
-            created = False
             try:
                 docker("run", "-d", "--name", name, "--label", "vpn-router.validation=" + name,
                        "--restart=no", "--init", "--read-only", "--tmpfs", "/tmp",
@@ -68,12 +75,16 @@ class ContainerTests(unittest.TestCase):
                        "-p", f"127.0.0.1:{api_port}:{api_port}/tcp",
                        "-p", f"127.0.0.1:{relay_port}:{relay_port}/tcp",
                        "-p", f"127.0.0.1:{relay_port}:{relay_port}/udp", IMAGE)
-                created = True
                 initial = wait_ready()
                 self.assertEqual(initial["connection_state"], "disconnected")
                 self.assertEqual(initial["oc_pid"], 0)
                 self.assertFalse(initial["auto_reconnect"])
+                self.assertFalse(initial["router_ready"])
                 update = health / "status.tmp"
+                update.write_text(json.dumps({"active": False, "ready": True, "updated": time.time()}))
+                update.replace(health / "status.json")
+                self.assertTrue(status()["router_ready"], "An idle native service must permit explicit Connect")
+                self.assertFalse(status()["router_active"], "Opening the dashboard must not activate routing")
                 update.write_text(json.dumps({"active": True, "updated": time.time()}))
                 update.replace(health / "status.json")
                 self.assertTrue(status()["router_active"], "Mounted native health must reflect atomic updates")
@@ -114,7 +125,7 @@ class ContainerTests(unittest.TestCase):
                 self.assertEqual(restarted["oc_pid"], 0)
                 self.assertEqual(restarted["relay_pid"], 0)
             finally:
-                if created:
+                if docker("ps", "-a", "--filter", "name=^/" + name + "$", "--format", "{{.Names}}") == name:
                     owner = docker("inspect", "--format", '{{index .Config.Labels "vpn-router.validation"}}', name)
                     if owner != name:
                         raise RuntimeError("Refusing to remove an unowned validation container")

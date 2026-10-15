@@ -35,7 +35,7 @@ That URL installs the latest **published release**, not unreleased checkout chan
 .\vpn.exe down
 ```
 
-The first Up requests UAC for the service, builds the contained runtime and explicitly initiates MFA. Configuration and logs stay outside the image. Changed image sources trigger a rebuild on the next start.
+Installation opens the dashboard and tray automatically. Opening the app or running `vpn dashboard` prepares an idle Windows service and builds/starts the Docker runtime without authenticating or changing routes. Choose Connect (or run `vpn up`) for one explicit MFA attempt; Windows routing activates after authentication succeeds. Configuration and logs stay outside the image. Changed image sources trigger a rebuild on the next start.
 
 Windows IP forwarding can cause a virtual-adapter routing loop. Up detects that conflict before authentication. Opt into `routing.manage_forwarding = true` to pause forwarding on the outbound adapter while routing and restore it on stop or crash; hotspot/machine forwarding may pause during the session. It is disabled by default.
 

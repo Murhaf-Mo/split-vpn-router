@@ -91,6 +91,7 @@ func fileHash(path string) (string, error) {
 
 type Snapshot struct {
 	Active  bool   `json:"active"`
+	Ready   bool   `json:"ready"`
 	Error   string `json:"error"`
 	Updated int64  `json:"updated"`
 }
@@ -158,7 +159,13 @@ func protectedDirectory(path string, public bool) error {
 }
 
 func writeStatus(active bool, message string) {
-	body, _ := json.Marshal(Snapshot{active, message, time.Now().Unix()})
+	writeSnapshot(active, active, message)
+}
+
+func writeReadyStatus() { writeSnapshot(false, true, "") }
+
+func writeSnapshot(active, ready bool, message string) {
+	body, _ := json.Marshal(Snapshot{Active: active, Ready: ready, Error: message, Updated: time.Now().Unix()})
 	path := filepath.Join(StatusDirectory(), "status.json")
 	tmp := path + ".tmp"
 	if os.WriteFile(tmp, body, 0600) != nil {
@@ -367,6 +374,12 @@ func Running() bool {
 }
 
 func Control(start bool) error {
+	return control(start, true)
+}
+
+func StartIdle() error { return control(true, false) }
+
+func control(start, waitAdapter bool) error {
 	m, err := connectManager()
 	if err != nil {
 		return err
@@ -400,6 +413,9 @@ func Control(start bool) error {
 			return nil
 		}
 		if start && status.State == svc.Running {
+			if !waitAdapter {
+				return nil
+			}
 			snap := ReadStatus()
 			if snap.Active {
 				return nil
@@ -500,6 +516,8 @@ func Serve(data string) error {
 	return svc.Run(ServiceName, &handler{data, filepath.Dir(exe)})
 }
 
+var errVPNNotReady = errors.New("VPN network is not ready")
+
 func readPolicy(data string, lastNetwork *string) (Policy, [32]byte, error) {
 	cfg, err := config.Load(filepath.Join(data, "config.toml"))
 	if err != nil {
@@ -507,6 +525,13 @@ func readPolicy(data string, lastNetwork *string) (Policy, [32]byte, error) {
 	}
 	read := func(name string) string { b, _ := os.ReadFile(filepath.Join(data, name)); return string(b) }
 	vpn, direct := read("vpn.list"), read("direct.list")
+	for _, list := range []string{vpn, direct} {
+		for _, entry := range ParseList(list) {
+			if _, err := Matcher(entry); err != nil {
+				return Policy{}, [32]byte{}, err
+			}
+		}
+	}
 	key := strings.TrimSpace(read("runtime/relay.key"))
 	networkBytes := read("runtime/network.json")
 	if networkBytes == "" {
@@ -517,7 +542,7 @@ func readPolicy(data string, lastNetwork *string) (Policy, [32]byte, error) {
 		Gateway string   `json:"gateway"`
 	}
 	if err := json.Unmarshal([]byte(networkBytes), &network); err != nil {
-		return Policy{}, [32]byte{}, fmt.Errorf("VPN network is not ready")
+		return Policy{}, [32]byte{}, errVPNNotReady
 	}
 	*lastNetwork = networkBytes
 	dns := cfg.DNS
@@ -683,10 +708,10 @@ func (h *handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 		finalError = err.Error()
 		return false, 1
 	}
-	forwarding, err = beginForwarding(cfg.ManageForwarding)
-	if err != nil {
-		finalError = err.Error()
-		return false, 1
+	if err := CheckForwarding(cfg.ManageForwarding); err != nil {
+		writeStatus(false, err.Error())
+	} else {
+		writeReadyStatus()
 	}
 	var previous [32]byte
 	tick := time.NewTicker(time.Second)
@@ -703,10 +728,23 @@ func (h *handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 				status <- req.CurrentStatus
 			}
 		case <-tick.C:
-			if err := forwarding.ensure(); err != nil {
-				finalError = err.Error()
-				status <- svc.Status{State: svc.StopPending}
-				return false, 1
+			if forwarding != nil {
+				if err := forwarding.ensure(); err != nil {
+					finalError = err.Error()
+					status <- svc.Status{State: svc.StopPending}
+					return false, 1
+				}
+			}
+			cfg, err = config.Load(filepath.Join(h.data, "config.toml"))
+			if err != nil {
+				writeStatus(current != nil, err.Error())
+				continue
+			}
+			if forwarding == nil {
+				if err := CheckForwarding(cfg.ManageForwarding); err != nil {
+					writeStatus(false, err.Error())
+					continue
+				}
 			}
 			if current != nil {
 				select {
@@ -724,8 +762,19 @@ func (h *handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 			}
 			policy, hash, err := readPolicy(h.data, &lastNetwork)
 			if err != nil {
+				if current == nil && errors.Is(err, errVPNNotReady) {
+					writeReadyStatus()
+					continue
+				}
 				writeStatus(current != nil, err.Error())
 				continue
+			}
+			if forwarding == nil {
+				forwarding, err = beginForwarding(cfg.ManageForwarding)
+				if err != nil {
+					writeStatus(false, err.Error())
+					continue
+				}
 			}
 			if current != nil && hash == previous {
 				writeStatus(true, "")

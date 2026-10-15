@@ -11,7 +11,6 @@ import (
 	"github.com/vpn/controller/internal/backend"
 	"github.com/vpn/controller/internal/config"
 	"github.com/vpn/controller/internal/platform"
-	"github.com/vpn/controller/internal/release"
 	"github.com/vpn/controller/internal/router"
 	"github.com/vpn/controller/internal/winproxy"
 	"golang.org/x/sys/windows"
@@ -67,10 +66,6 @@ func Up(e *Env) (result error) {
 		return fmt.Errorf("another connection operation is in progress: %w", err)
 	}
 	defer windows.CloseHandle(mutex)
-	cfg, err := config.Load(e.Cfg.Path)
-	if err != nil {
-		return err
-	}
 	for _, which := range []string{"vpn", "direct"} {
 		body, err := os.ReadFile(filepath.Join(e.DataDir, which+".list"))
 		if err != nil {
@@ -82,47 +77,14 @@ func Up(e *Env) (result error) {
 			}
 		}
 	}
-	// Validate everything that can fail locally before asking the VPN to authenticate.
+	if err := OpenDashboard(e, ""); err != nil {
+		return err
+	}
+	cfg, err := config.Load(e.Cfg.Path)
+	if err != nil {
+		return err
+	}
 	if err := router.CheckForwarding(cfg.ManageForwarding); err != nil {
-		return err
-	}
-	if _, err := os.Stat(filepath.Join(e.InstallDir, "sing-box.exe")); err != nil {
-		return fmt.Errorf("sing-box.exe is missing; run .\\prepare-runtime.ps1 or reinstall: %w", err)
-	}
-	if err := backend.Check(); err != nil {
-		return err
-	}
-	if !router.Installed() || router.PreparedFor(e.InstallDir, e.DataDir) != nil {
-		fmt.Println("[up] installing Windows router service (UAC)...")
-		if router.Admin() {
-			if err := router.Prepare(e.DataDir); err != nil {
-				return err
-			}
-		} else {
-			if err := router.Elevate(e.DataDir); err != nil {
-				return err
-			}
-		}
-	}
-	if err := router.PreparedFor(e.InstallDir, e.DataDir); err != nil {
-		return err
-	}
-	if status, err := Client(e).Quick().Status(); err == nil && status.ConnectionState == "connected" {
-		if !router.ReadStatus().Active {
-			if err := router.Control(true); err != nil {
-				return err
-			}
-		}
-		return Status(e)
-	}
-	// Save the canonical Docker-only schema. Old credentials/lists survive migration.
-	if err := winproxy.CleanupLegacy(); err != nil {
-		return err
-	}
-	if err := config.Save(cfg.Path, cfg); err != nil {
-		return err
-	}
-	if err := backend.Start(e.InstallDir, e.DataDir, release.LocalVersion(), cfg); err != nil {
 		return err
 	}
 	connected := false
@@ -353,6 +315,9 @@ func DashboardURL(e *Env) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/#token=%s", e.Cfg.APIport, backend.Token(e.DataDir))
 }
 func OpenDashboard(e *Env, hash string) error {
+	if err := Start(e); err != nil {
+		return err
+	}
 	if hash != "" {
 		hash = "&" + strings.TrimPrefix(hash, "#")
 	}
@@ -419,6 +384,7 @@ func Autostart(e *Env, args []string) error {
 func Usage() {
 	fmt.Println(`vpn — Docker VPN runtime with a Windows TUN router
   vpn configure                  VPN credentials; auto reconnect defaults off
+  vpn start                       start the dashboard/runtime without connecting
   vpn up | down | restart         explicit connect/disconnect (Up installs the service with UAC)
   vpn status                      VPN and Windows router health
   vpn mode [direct-default|vpn-default]

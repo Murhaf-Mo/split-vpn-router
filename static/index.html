@@ -14,7 +14,7 @@
     <h2 id="connection-title">Connection</h2>
     <p id="connection">Checking connection…</p>
     <div class="actions"><button id="connect">Connect VPN</button><button id="disconnect" class="secondary">Disconnect VPN</button><button id="refresh" class="secondary">Refresh</button></div>
-    <p class="hint">Connecting sends an MFA request. A timeout or declined request leaves the VPN disconnected until you choose Connect again. Windows routing starts with <code>vpn up</code>; check it with <code>vpn status</code>.</p>
+    <p class="hint">Connecting sends one MFA request. Windows routing starts when authentication succeeds. A timeout or declined request leaves the VPN disconnected until you choose Connect again.</p>
     <p id="error" role="alert"></p>
   </section>
   <section aria-labelledby="routing-title">
@@ -36,6 +36,8 @@
       <label>Corporate DNS IP<input id="dns" placeholder="Use VPN-provided DNS"></label>
     </div>
     <label class="checkbox"><input id="reconnect" type="checkbox">Allow transport reconnect with the existing session</label>
+    <label class="checkbox"><input id="forwarding" type="checkbox">Manage Windows IP forwarding during the VPN session</label>
+    <p class="hint">Enable this if a forwarding conflict is reported. The app pauses forwarding on the outbound adapter and restores it on stop or crash. Hotspot or machine-to-machine forwarding may pause during the session.</p>
     <p class="hint">Off by default. This never repeats password authentication or sends a fresh MFA request. Changes take effect on the next connection.</p>
     <button>Save settings</button></form>
   </section>

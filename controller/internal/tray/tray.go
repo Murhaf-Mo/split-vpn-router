@@ -16,9 +16,12 @@ import (
 
 	"github.com/getlantern/systray"
 	"github.com/vpn/controller/internal/api"
+	"github.com/vpn/controller/internal/backend"
 	"github.com/vpn/controller/internal/cli"
 	"github.com/vpn/controller/internal/release"
 	"github.com/vpn/controller/internal/router"
+	"golang.org/x/sys/windows"
+	"unsafe"
 )
 
 // updateCheckInterval is how often the tray polls GitHub for a newer release.
@@ -44,13 +47,32 @@ var iconWarn []byte
 var iconOff []byte
 
 var (
-	env        *cli.Env
-	currentIcn atomic.Value // string — which icon is loaded
-	lastMode   atomic.Value // string — last seen mode
+	env         *cli.Env
+	currentIcn  atomic.Value // string — which icon is loaded
+	lastMode    atomic.Value // string — last seen mode
+	openOnStart bool
 )
 
 // Run blocks until the user picks Quit.
 func Run(e *cli.Env) {
+	for _, arg := range os.Args[1:] {
+		if arg == "--dashboard" {
+			openOnStart = true
+		}
+	}
+	name, _ := windows.UTF16PtrFromString(`Local\VPNRouterTray-` + backend.Name(e.DataDir))
+	mutex, err := windows.CreateMutex(nil, false, name)
+	if mutex != 0 {
+		defer windows.CloseHandle(mutex)
+	}
+	if err != nil {
+		if err == windows.ERROR_ALREADY_EXISTS && openOnStart {
+			if err := cli.OpenDashboard(e, ""); err != nil {
+				ReportError(e.DataDir, "dashboard", err)
+			}
+		}
+		return
+	}
 	env = e
 	systray.Run(onReady, func() {})
 }
@@ -98,6 +120,12 @@ func onReady() {
 	// timestamp in DataDir/.update-check survives tray restarts so opening
 	// and closing the tray doesn't bypass the rate limit.
 	go updateChecker(updateItem)
+	go runVerb("start", func() error {
+		if openOnStart {
+			return cli.OpenDashboard(env, "")
+		}
+		return cli.Start(env)
+	})
 
 	// Action handlers.
 	go func() {
@@ -112,7 +140,7 @@ func onReady() {
 			case <-modeToggle.ClickedCh:
 				go runVerb("mode", switchMode)
 			case <-dashItem.ClickedCh:
-				_ = cli.OpenDashboard(env, "")
+				go runVerb("dashboard", func() error { return cli.OpenDashboard(env, "") })
 			case <-updateItem.ClickedCh:
 				// cli.Upgrade spawns msiexec and returns immediately; the
 				// tray keeps running until MSI replaces our exe (when it
@@ -201,7 +229,23 @@ func setIcon(state string) {
 func runVerb(label string, fn func() error) {
 	if err := fn(); err != nil {
 		systray.SetTooltip("vpn — " + label + ": " + err.Error())
+		ReportError(env.DataDir, label, err)
 	}
+}
+
+// Tray applications have no console; failures must remain visible and diagnosable.
+func ReportError(data, label string, err error) {
+	if data != "" {
+		dir := filepath.Join(data, "runtime")
+		_ = os.MkdirAll(dir, 0700)
+		if log, openErr := os.OpenFile(filepath.Join(dir, "tray.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); openErr == nil {
+			fmt.Fprintln(log, time.Now().Format(time.RFC3339), label+":", err)
+			log.Close()
+		}
+	}
+	message, _ := windows.UTF16PtrFromString(label + ": " + err.Error())
+	title, _ := windows.UTF16PtrFromString("Split VPN Router")
+	windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW").Call(0, uintptr(unsafe.Pointer(message)), uintptr(unsafe.Pointer(title)), 0x10)
 }
 
 // updateChecker polls GitHub for newer releases on a 24h cadence and reveals

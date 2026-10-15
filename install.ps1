@@ -113,7 +113,7 @@ $logPath = Join-Path $env:TEMP "wsl-vpn-router-install.log"
 $msi = Start-Process -FilePath 'msiexec.exe' `
     -ArgumentList '/i', "`"$msiPath`"", '/qb', '/norestart', '/l*v', "`"$logPath`"" `
     -Wait -PassThru
-if ($msi.ExitCode -ne 0) {
+if ($msi.ExitCode -notin @(0, 3010)) {
     Fail "msiexec returned $($msi.ExitCode). Verbose log: $logPath"
 }
 Info "OK"
@@ -155,7 +155,7 @@ if (-not $docker) {
     if ($LASTEXITCODE -ne 0) { Warn "Start Docker Desktop before running vpn up." }
 }
 Info "This installer does not install or reconfigure a WSL distro."
-Info "The Windows routing service is prepared by vpn up with UAC. Installation never authenticates."
+Info "Startup prepares an idle Windows routing service and opens the dashboard. Installation never authenticates."
 
 # ---------- 7. First-run configuration wizard ----------
 Step "Configuring (interactive)"
@@ -180,6 +180,15 @@ if ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]') {
 }
 
 # ---------- 9. Done ----------
+Step "Opening Split VPN Router"
+if ($rc -eq 0) {
+    & "$installDir\vpn.exe" dashboard
+    if ($LASTEXITCODE -ne 0) {
+        Warn "Startup failed. Review the error above, then run vpn dashboard again."
+    } else {
+        Start-Process -FilePath "$installDir\vpn-tray.exe" -WorkingDirectory $installDir -WindowStyle Hidden
+    }
+}
 Step "Done."
 Info "Try: vpn up        (brings the tunnel up)"
 Info "     vpn status    (health check)"

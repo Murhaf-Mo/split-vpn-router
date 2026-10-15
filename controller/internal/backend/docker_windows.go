@@ -131,6 +131,10 @@ func Start(install, data, version string, c *config.Config) error {
 	if err := Stop(data); err != nil {
 		return err
 	}
+	// Never activate Windows routing from metadata left by a previous container.
+	if err := os.Remove(filepath.Join(data, "runtime", "network.json")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	var mount strings.Builder
 	writer := csv.NewWriter(&mount)
 	_ = writer.Write([]string{"type=bind", "source=" + data, "target=/data"})
@@ -163,6 +167,20 @@ func sourceSignature(install string) (string, error) {
 		hash.Write(b)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// Check the running container's immutable image, not the possibly updated tag.
+func Current(install, data string) bool {
+	signature, err := sourceSignature(install)
+	if err != nil {
+		return false
+	}
+	image, err := run("inspect", "--format", "{{.Image}}", Name(data))
+	if err != nil {
+		return false
+	}
+	built, err := run("image", "inspect", "--format", `{{index .Config.Labels "`+label+`.source"}}`, image)
+	return err == nil && built == signature
 }
 
 func Stop(data string) error {

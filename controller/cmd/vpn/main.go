@@ -95,6 +95,8 @@ func main() {
 		tray.Run(env)
 	case "up":
 		exitOnErr(cli.Up(env))
+	case "start":
+		exitOnErr(cli.Start(env))
 	case "down":
 		exitOnErr(cli.Down(env))
 	case "restart":

@@ -9,6 +9,7 @@ import (
 
 	"github.com/vpn/controller/internal/config"
 	"github.com/vpn/controller/internal/platform"
+	"github.com/vpn/controller/internal/router"
 	"golang.org/x/term"
 )
 
@@ -58,6 +59,18 @@ func Configure(_ []string) error {
 	c.DNS = prompt("Corporate DNS IP (blank uses VPN-provided DNS)", c.DNS)
 	c.DirectDNS = prompt("Home/public DNS IP", c.DirectDNS)
 	c.Mode = prompt("Mode: direct-default or vpn-default", c.Mode)
+	if router.CheckForwarding(false) != nil {
+		fmt.Println("Windows IP forwarding is enabled. The router can pause it during a VPN session and restore it afterward; hotspot/machine forwarding may pause.")
+		previous := "n"
+		if c.ManageForwarding {
+			previous = "y"
+		}
+		answer := strings.ToLower(prompt("Manage forwarding during VPN sessions? y/n", previous))
+		if answer != "y" && answer != "n" {
+			return fmt.Errorf("answer y or n for forwarding management")
+		}
+		c.ManageForwarding = answer == "y"
+	}
 	// Reconfiguration never enables automatic reconnect implicitly.
 	if c.VPNHost == "" || c.VPNUser == "" || c.VPNPassword == "" {
 		return fmt.Errorf("VPN host, username and password are required")

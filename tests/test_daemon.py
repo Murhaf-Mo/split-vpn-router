@@ -141,8 +141,14 @@ class DaemonTests(unittest.TestCase):
                     self.assertEqual(error.exception.code, expected)
                 connect.assert_not_called()
                 request = Request(f"http://127.0.0.1:{port}/api/connect", data=b"{}", headers={"Authorization": "Bearer " + "a" * 64})
-                with urlopen(request, timeout=3) as response:
-                    self.assertEqual(response.status, 202)
+                with patch.object(daemon, "build_status", return_value={"router_ready": False, "router_error": "Forwarding conflict"}):
+                    with self.assertRaises(HTTPError) as error:
+                        urlopen(request, timeout=3)
+                    self.assertEqual(error.exception.code, 409)
+                connect.assert_not_called()
+                with patch.object(daemon, "build_status", return_value={"router_ready": True}):
+                    with urlopen(request, timeout=3) as response:
+                        self.assertEqual(response.status, 202)
                 connect.assert_called_once()
         finally:
             server.shutdown()

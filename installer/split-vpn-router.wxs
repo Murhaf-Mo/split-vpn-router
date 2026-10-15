@@ -120,6 +120,7 @@
       <Component Id="cmpStartMenuShortcut" Guid="A2B1C3D4-0004-0004-0004-000000000001" Directory="AppMenuDir">
         <Shortcut Id="scStartMenuTray"
                   Name="Split VPN Router"
+                  Arguments="--dashboard"
                   Description="System tray for the Docker VPN router"
                   Target="[INSTALLDIR]vpn-tray.exe"
                   WorkingDirectory="INSTALLDIR"
@@ -142,6 +143,7 @@
       <Component Id="cmpDesktopShortcut" Guid="A2B1C3D4-0004-0004-0004-000000000002" Directory="DesktopFolder">
         <Shortcut Id="scDesktopTray"
                   Name="Split VPN Router"
+                  Arguments="--dashboard"
                   Description="System tray for the Docker VPN router"
                   Target="[INSTALLDIR]vpn-tray.exe"
                   WorkingDirectory="INSTALLDIR"
@@ -170,6 +172,7 @@
       <!-- vpn.exe / vpn-tray.exe / vpnctl.py read InstallDir from this key to
            locate static/ and the daemon script. Removed on uninstall. -->
       <Component Id="cmpHklmKey" Guid="A2B1C3D4-0003-0003-0003-000000000001" Directory="INSTALLDIR">
+        <Environment Id="AppPath" Name="PATH" Value="[INSTALLDIR]" Action="set" Part="last" System="yes"/>
         <RegistryKey Root="HKLM" Key="Software\wsl-vpn-router">
           <RegistryValue Type="string" Name="InstallDir" Value="[INSTALLDIR]" KeyPath="yes"/>
           <RegistryValue Type="string" Name="Version" Value="$(var.Version)"/>

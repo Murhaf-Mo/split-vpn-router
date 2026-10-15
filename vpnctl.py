@@ -71,7 +71,8 @@ def read_config_for_api():
     vpn = cfg.get("vpn", {})
     return {"vpn": {k: vpn.get(k, "") for k in ("host", "user", "group", "dns_server")} | {
                 "password_set": bool(vpn.get("password")), "auto_reconnect": vpn.get("auto_reconnect", False)},
-            "routing": {"mode": cfg.get("routing", {}).get("mode", "direct-default")},
+            "routing": {"mode": cfg.get("routing", {}).get("mode", "direct-default"),
+                        "manage_forwarding": cfg.get("routing", {}).get("manage_forwarding", False)},
             "docker": {"api_port": cfg.get("docker", {}).get("api_port", 8889),
                        "relay_port": cfg.get("docker", {}).get("relay_port", 1080)}}
 
@@ -93,15 +94,15 @@ def update_config(body):
     with LOCK:
         cfg = load_config()
         for section, allowed in {"vpn": ("host", "user", "password", "group", "dns_server", "auto_reconnect"),
-                                 "routing": ("mode",)}.items():
+                                 "routing": ("mode", "manage_forwarding")}.items():
             values = body.get(section, {})
             if not isinstance(values, dict):
                 raise ValueError("Configuration sections must be objects")
             for key in allowed:
                 if key in values and (key != "password" or values[key]):
-                    if key == "auto_reconnect":
+                    if key in ("auto_reconnect", "manage_forwarding"):
                         if not isinstance(values[key], bool):
-                            raise ValueError("auto_reconnect must be true or false")
+                            raise ValueError(key + " must be true or false")
                     elif not isinstance(values[key], str):
                         raise ValueError(key + " must be a string")
                     cfg.setdefault(section, {})[key] = values[key]
@@ -309,8 +310,10 @@ def build_status():
     router_status = {}
     with contextlib.suppress(OSError, ValueError):
         router_status = json.loads(Path("/router-status/status.json").read_text())
-    router_active = router_status.get("active", False) and time.time() - router_status.get("updated", 0) < 6
-    status.update(router_active=router_active, router_error=router_status.get("error", ""))
+    fresh = 0 <= time.time() - router_status.get("updated", 0) < 6
+    router_active = router_status.get("active", False) and fresh
+    status.update(router_active=router_active, router_ready=fresh and router_status.get("ready", router_status.get("active", False)) and not router_status.get("error"),
+                  router_error=router_status.get("error", ""))
     status.update(version=os.environ.get("VPN_VERSION", "dev"), mode=cfg.get("routing", {}).get("mode", "direct-default"),
                   runtime="docker", router="windows-tun", tun0_ip=network.get("address", "") if status["oc_pid"] else "",
                   proxy_host="127.0.0.1", proxy_port=cfg.get("docker", {}).get("relay_port", 1080),
@@ -398,6 +401,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("JSON object required")
             path = urlsplit(self.path).path
             if path == "/api/connect":
+                readiness = build_status()
+                if not readiness["router_ready"]:
+                    return self.send({"error": readiness["router_error"] or "Windows routing service is unavailable; open the app again or run vpn start."}, 409)
                 connect()
                 return self.send(build_status(), 202)
             if path == "/api/disconnect":

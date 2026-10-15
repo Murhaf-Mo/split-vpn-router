@@ -9,6 +9,7 @@ const token = sessionStorage.getItem('vpn-router-token') || '';
 let busy = false;
 let refreshing = false;
 let renderedLists = '';
+let serverError = '';
 
 async function api(path, body) {
   const response = await fetch('/api/' + path, {
@@ -60,10 +61,11 @@ async function refresh() {
     $('connection').textContent = status.connection_state === 'connected'
       ? status.router_active ? 'VPN and Windows routing are connected.' : 'VPN is connected, but Windows routing is inactive. Run vpn up to restore routing.'
       : status.connection_state === 'connecting' ? 'Waiting for VPN authentication…' : 'VPN disconnected. Choose Connect when you are ready.';
-    $('connect').disabled = status.connection_state !== 'disconnected' || !status.router_active;
+    $('connect').disabled = status.connection_state !== 'disconnected' || !status.router_ready;
     $('disconnect').disabled = status.connection_state === 'disconnected';
-    if (status.error) $('error').textContent = status.error;
-    else if (status.router_error) $('error').textContent = status.router_error;
+    const nextError = status.error || status.router_error || '';
+    if (nextError || $('error').textContent === serverError) $('error').textContent = nextError;
+    serverError = nextError;
     if (document.activeElement !== $('mode')) $('mode').value = status.mode;
     const [vpn, direct] = await Promise.all([api('lists/vpn'), api('lists/direct')]);
     const signature = JSON.stringify([vpn.entries, direct.entries]);
@@ -94,7 +96,8 @@ $('settings').addEventListener('submit', (event) => {
   event.preventDefault();
   action(async () => {
     await api('config', { vpn: { host: $('host').value, user: $('user').value, password: $('password').value,
-      group: $('group').value, dns_server: $('dns').value, auto_reconnect: $('reconnect').checked } });
+      group: $('group').value, dns_server: $('dns').value, auto_reconnect: $('reconnect').checked },
+      routing: { manage_forwarding: $('forwarding').checked } });
     $('password').value = '';
   });
 });
@@ -106,6 +109,7 @@ async function initialize() {
     const cfg = await api('config');
     $('host').value = cfg.vpn.host; $('user').value = cfg.vpn.user; $('group').value = cfg.vpn.group;
     $('dns').value = cfg.vpn.dns_server; $('reconnect').checked = cfg.vpn.auto_reconnect === true;
+    $('forwarding').checked = cfg.routing.manage_forwarding === true;
   } catch (error) { showError(error); }
   await refresh();
   setInterval(() => { if (!busy && !document.hidden) refresh(); }, 3000);
