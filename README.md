@@ -6,7 +6,42 @@ Put a domain, URL, IP or CIDR in `vpn.list` to send its connections through your
 
 The repository and checkout are named `split-vpn-router`. Historical Windows installation/data/registry names and MSI release asset filenames remain stable for upgrades. The tool no longer provisions, launches or modifies a WSL distro. Docker Desktop manages its own backend. If you also want WSL absent from Windows, choose a Docker backend supported by your Windows edition, such as Hyper-V. The installer leaves Docker's backend alone.
 
+## How routing works
+
+Windows networking applies one routing policy to normal application TCP/UDP traffic. Apps do not need separate proxy settings. Corporate DNS also travels through the VPN relay.
+
+```mermaid
+flowchart TD
+    A["Windows applications<br/>Browsers · Git · other normal TCP/UDP apps"]
+    A --> W["Windows virtual network adapter"]
+    W --> R["One routing policy<br/>Domains · URL hosts · IPs · CIDRs"]
+
+    R -->|Direct destination| H["Home internet"]
+    R -->|VPN destination| E["Encrypted TCP/UDP relay"]
+
+    subgraph Docker["Isolated Docker container"]
+        E --> L["Relay bound to VPN tunnel"]
+        L --> O["OpenConnect"]
+    end
+
+    O --> V["Corporate VPN"]
+    S["Windows service<br/>Adapter lifecycle · forwarding recovery"] -. manages .-> W
+```
+
+The previous design depended on each app reading PAC, environment or Git proxy settings. Some apps ignored those settings or cached them until restart. The native adapter removes that dependency for normal Windows traffic; Docker contains the VPN runtime.
+
 ## Connection behavior
+
+Opening the app prepares the dashboard and idle service. Only an explicit Connect action initiates VPN authentication; routing starts after authentication succeeds.
+
+```mermaid
+flowchart LR
+    A["Open app"] --> B["Dashboard + container<br/>Idle Windows service"]
+    B --> C["You choose Connect"]
+    C --> D["One MFA attempt"]
+    D -->|Success| E["Activate Windows routing"]
+    D -->|Timeout or decline| F["Stay disconnected<br/>No automatic authentication retry"]
+```
 
 - Installation, tray startup and container restart never log in to the VPN.
 - Up/Connect initiates one password authentication attempt.
