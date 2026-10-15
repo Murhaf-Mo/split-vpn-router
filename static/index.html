@@ -1,195 +1,46 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8"/>
-    <meta content="width=device-width,initial-scale=1" name="viewport"/>
-    <title>vpn · dashboard</title>
-    <link href="/static/style.css" rel="stylesheet"/>
-    <link href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2334d399'/></svg>" rel="icon"/>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Split VPN Router</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
 </head>
 <body>
-<header class="topbar">
-    <div class="brand">
-        <span class="logo-dot" id="brandDot"></span>
-        <span class="brand-name">vpn</span>
-        <span class="brand-sub" id="brandSub">connecting…</span>
-        <span class="brand-ver" id="brandVer" title="wsl-vpn-router version"></span>
+<main>
+  <header><div><h1>Split VPN Router</h1><p>Choose the destinations that use your VPN.</p></div><span id="status" role="status">Loading…</span></header>
+  <section aria-labelledby="connection-title">
+    <h2 id="connection-title">Connection</h2>
+    <p id="connection">Checking connection…</p>
+    <div class="actions"><button id="connect">Connect VPN</button><button id="disconnect" class="secondary">Disconnect VPN</button><button id="refresh" class="secondary">Refresh</button></div>
+    <p class="hint">Connecting sends an MFA request. A timeout or declined request leaves the VPN disconnected until you choose Connect again. Windows routing starts with <code>vpn up</code>; check it with <code>vpn status</code>.</p>
+    <p id="error" role="alert"></p>
+  </section>
+  <section aria-labelledby="routing-title">
+    <h2 id="routing-title">Routing</h2>
+    <label>Default route <select id="mode"><option value="direct-default">Home network, except VPN destinations</option><option value="vpn-default">VPN, except direct destinations</option></select></label>
+    <p class="hint">VPN rules take precedence. Changes apply to new connections; an existing download or socket may reconnect. URL inputs select the entire host, including HTTPS and SSH connections.</p>
+    <div class="columns">
+      <div><h3>Always use VPN</h3><form id="vpn-form"><label for="vpn-entry">URL, domain, IP or CIDR</label><div class="input-row"><input id="vpn-entry" required placeholder="https://internal.example.com"><button>Add</button></div></form><ul id="vpn-list"></ul></div>
+      <div><h3>Always use home network</h3><form id="direct-form"><label for="direct-entry">URL, domain, IP or CIDR</label><div class="input-row"><input id="direct-entry" required placeholder="*.example.com"><button>Add</button></div></form><ul id="direct-list"></ul></div>
     </div>
-    <div class="topbar-actions">
-        <button class="btn ghost" data-action="reload" title="Reload PAC + lists">
-            <svg height="14" viewBox="0 0 24 24" width="14">
-                <path d="M12 5V2L8 6l4 4V7a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Zm-5 7H5a7 7 0 0 0 12 4.9V20l4-4-4-4v3a5 5 0 0 1-9-3Z" fill="currentColor"/>
-            </svg>
-            Reload
-        </button>
-        <button class="btn ghost" data-action="restart-oc" title="Restart the openconnect tunnel">
-            <svg height="14" viewBox="0 0 24 24" width="14">
-                <path d="M12 2v3a7 7 0 1 1-7 7H2a10 10 0 1 0 10-10Z" fill="currentColor"/>
-            </svg>
-            Reconnect
-        </button>
+  </section>
+  <section aria-labelledby="settings-title">
+    <h2 id="settings-title">VPN settings</h2>
+    <form id="settings"><div class="columns">
+      <label>VPN host<input id="host" required autocomplete="off"></label>
+      <label>Username<input id="user" required autocomplete="username"></label>
+      <label>Password<input id="password" type="password" autocomplete="new-password" placeholder="Leave blank to keep current"></label>
+      <label>Auth group<input id="group" autocomplete="off"></label>
+      <label>Corporate DNS IP<input id="dns" placeholder="Use VPN-provided DNS"></label>
     </div>
-</header>
-
-<main class="grid">
-
-    <!-- Status overview -->
-    <section class="card span-2">
-        <div class="card-head">
-            <h2>Status</h2>
-            <span class="meta" id="updatedAt">—</span>
-        </div>
-        <div class="status-grid">
-            <div class="stat">
-                <div class="stat-label">Tunnel</div>
-                <div class="stat-row">
-                    <span class="dot" id="dotTun"></span>
-                    <span class="stat-value" id="valTun">—</span>
-                </div>
-                <div class="stat-sub" id="subTun">tun0</div>
-            </div>
-            <div class="stat">
-                <div class="stat-label">Proxy</div>
-                <div class="stat-row">
-                    <span class="dot" id="dotProxy"></span>
-                    <span class="stat-value" id="valProxy">—</span>
-                </div>
-                <div class="stat-sub" id="subProxy">tinyproxy</div>
-            </div>
-            <div class="stat">
-                <div class="stat-label">Daemon</div>
-                <div class="stat-row">
-                    <span class="dot" id="dotPac"></span>
-                    <span class="stat-value" id="valPac">—</span>
-                </div>
-                <div class="stat-sub" id="subPac">vpnctl.py</div>
-            </div>
-            <div class="stat">
-                <div class="stat-label">Mode</div>
-                <div aria-label="Routing mode" class="mode-toggle" role="tablist">
-                    <button class="mode-btn" data-mode="vpn-default" role="tab">vpn-default</button>
-                    <button class="mode-btn" data-mode="direct-default" role="tab">direct-default</button>
-                </div>
-                <div class="stat-sub" id="modeHint">—</div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Add host (unified, with target toggle) -->
-    <section class="card span-2">
-        <div class="card-head">
-            <h2>Add host</h2>
-            <span class="meta">pick which list, type a host/CIDR/URL, press Add</span>
-        </div>
-        <form class="addhost" id="addHostForm">
-            <div class="addhost-target" aria-label="Target list" role="tablist">
-                <button type="button" class="seg active" data-target="vpn" role="tab">VPN (vpn.list)</button>
-                <button type="button" class="seg" data-target="direct" role="tab">Direct (direct.list)</button>
-            </div>
-            <input id="addHostInput" autocomplete="off" spellcheck="false" type="text"
-                   placeholder="e.g. github.com  •  *.example.com  •  10.0.0.0/8  •  https://api.x.com/v1/*"/>
-            <button class="btn primary" type="submit">Add</button>
-        </form>
-        <div class="addhost-extra">
-            <button class="btn ghost sm" id="addFromHosts" type="button"
-                    title="Add the hostnames pinned in your Windows hosts file to the selected list">
-                + From Windows hosts file
-            </button>
-            <span class="meta">pulls hostnames mapped in C:\Windows\System32\drivers\etc\hosts into the selected list</span>
-        </div>
-    </section>
-
-    <!-- vpn.list -->
-    <section class="card">
-        <div class="card-head">
-            <h2>vpn.list <span class="pill" id="vpnCount">0</span></h2>
-            <div class="list-tools">
-                <button class="btn ghost sm" data-export="vpn" title="Download vpn.list">Export</button>
-                <button class="btn ghost sm" data-import="vpn" title="Replace vpn.list from a file">Import</button>
-            </div>
-        </div>
-        <ul class="list" id="vpnList"></ul>
-    </section>
-
-    <!-- direct.list -->
-    <section class="card">
-        <div class="card-head">
-            <h2>direct.list <span class="pill" id="directCount">0</span></h2>
-            <div class="list-tools">
-                <button class="btn ghost sm" data-export="direct" title="Download direct.list">Export</button>
-                <button class="btn ghost sm" data-import="direct" title="Replace direct.list from a file">Import</button>
-            </div>
-        </div>
-        <ul class="list" id="directList"></ul>
-    </section>
-
-    <!-- Configuration -->
-    <section class="card span-2">
-        <div class="card-head">
-            <h2>Configuration</h2>
-            <span class="meta" id="cfgHint">edits to anything but mode need a restart</span>
-        </div>
-        <form class="cfg-form" id="cfgForm">
-            <div class="cfg-grid">
-                <label>VPN host
-                    <input id="cfgHost" type="text" placeholder="vpn.example.com" autocomplete="off" spellcheck="false"/>
-                </label>
-                <label>VPN username
-                    <input id="cfgUser" type="text" autocomplete="off" spellcheck="false"/>
-                </label>
-                <label>VPN password
-                    <input id="cfgPassword" type="password" placeholder="(unchanged)" autocomplete="new-password"/>
-                </label>
-                <label>VPN auth group
-                    <input id="cfgGroup" type="text" placeholder="(none)" autocomplete="off" spellcheck="false"/>
-                </label>
-                <label>WSL distro
-                    <input id="cfgDistro" type="text" autocomplete="off" spellcheck="false"/>
-                </label>
-                <label>WSL sudo password
-                    <input id="cfgSudo" type="password" placeholder="(unchanged)" autocomplete="new-password"/>
-                </label>
-                <label>tinyproxy port
-                    <input id="cfgHttpPort" type="number" min="1" max="65535"/>
-                </label>
-                <label>PAC port
-                    <input id="cfgPacPort" type="number" min="1" max="65535"/>
-                </label>
-                <label>bind address
-                    <input id="cfgBindAddr" type="text" autocomplete="off" spellcheck="false"/>
-                </label>
-                <label>routing mode
-                    <select id="cfgMode">
-                        <option value="vpn-default">vpn-default</option>
-                        <option value="direct-default">direct-default</option>
-                    </select>
-                </label>
-            </div>
-            <div class="cfg-actions">
-                <button class="btn primary" type="submit">Save configuration</button>
-                <span class="meta" id="cfgSaveHint"></span>
-            </div>
-        </form>
-    </section>
-
-    <!-- Logs -->
-    <section class="card span-2">
-        <div class="card-head">
-            <h2>Logs</h2>
-            <div aria-label="Log file" class="tabs" role="tablist">
-                <button class="tab active" data-log="oc" role="tab">openconnect</button>
-                <button class="tab" data-log="pac" role="tab">vpnctl</button>
-                <button class="tab" data-log="proxy" role="tab">tinyproxy</button>
-                <span class="tabs-spacer"></span>
-                <label class="follow"><input checked id="follow" type="checkbox"/> follow</label>
-            </div>
-        </div>
-        <pre class="log" id="logView">loading…</pre>
-    </section>
-
+    <label class="checkbox"><input id="reconnect" type="checkbox">Allow transport reconnect with the existing session</label>
+    <p class="hint">Off by default. This never repeats password authentication or sends a fresh MFA request. Changes take effect on the next connection.</p>
+    <button>Save settings</button></form>
+  </section>
+  <section aria-labelledby="logs-title"><h2 id="logs-title">Diagnostics</h2><div class="actions"><button class="secondary" data-log="oc">VPN log</button><button class="secondary" data-log="proxy">Relay log</button><button class="secondary" data-log="pac">Daemon log</button></div><pre id="logs" tabindex="0">Choose a log.</pre></section>
+  <footer>Docker VPN runtime · Windows virtual network adapter · No per-app proxy setup</footer>
 </main>
-
-<div aria-live="polite" class="toast" id="toast" role="status"></div>
-<script src="/static/app.js"></script>
 </body>
 </html>

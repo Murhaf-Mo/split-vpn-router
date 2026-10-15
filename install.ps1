@@ -1,27 +1,11 @@
-# wsl-vpn-router installer.
+# Split VPN Router installer.
 #
 # One-liner usage (from any PowerShell, elevated or not):
-#   irm https://raw.githubusercontent.com/Murhaf-Mo/wsl-vpn-router/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/Murhaf-Mo/split-vpn-router/main/install.ps1 | iex
 #
-# Flow:
-#   1. Self-elevate (one UAC prompt) so msiexec + wsl-install + wizard all
-#      run in the same elevated console with visible output.
-#   2. Asks GitHub for the latest release tag.
-#   3. Downloads wsl-vpn-router-<ver>.msi + .msi.sha256 sidecar to %TEMP%.
-#   4. Verifies SHA-256.
-#   5. Runs msiexec /i <msi> /qb /norestart - copies binaries to
-#      C:\Program Files\wsl-vpn-router\, writes HKLM key. ~10s, visible
-#      MSI progress bar.
-#   6. Runs wslprovision.ps1 in this same console: you SEE the DISM output,
-#      wsl --install download progress, and apt install output as they happen.
-#   7. Runs vpn configure (interactive wizard) so first-run config writes
-#      to the launching user's %LOCALAPPDATA%\wsl-vpn-router\.
-#
-# Why this layout: putting the WSL provisioning inside the MSI made it run
-# silently via WixQuietExec, leaving users staring at a frozen "Please wait
-# while Windows configures wsl-vpn-router" dialog for the 5+ minutes wsl
-# install takes. Moving it out into the wrapper means everything happens in
-# a console where progress is visible.
+# Flow: download and verify the MSI, install files, check Docker, configure credentials.
+# No VPN connection is made by installation or tray startup. vpn up is explicit.
+# Docker Desktop is an external prerequisite; its chosen backend is left alone.
 #
 # Style: pure ASCII (no smart-quotes, no em-dashes, no curly quotes). Windows
 # PowerShell 5.1 reads .ps1 files using the system ANSI codepage by default;
@@ -31,7 +15,7 @@
 #requires -Version 5.1
 $ErrorActionPreference = 'Stop'
 
-$Repo    = 'Murhaf-Mo/wsl-vpn-router'
+$Repo    = 'Murhaf-Mo/split-vpn-router'
 $ApiBase = "https://api.github.com/repos/$Repo"
 $RawBase = "https://raw.githubusercontent.com/$Repo/main"
 
@@ -83,7 +67,7 @@ if (-not (Test-Admin)) {
 }
 
 # ---------- 1. Header ----------
-Step "wsl-vpn-router installer"
+Step "Split VPN Router installer"
 Info "repo: https://github.com/$Repo"
 Info "running elevated as: $env:USERNAME"
 
@@ -160,23 +144,18 @@ if (-not (Test-Path (Join-Path $installDir 'vpn.exe'))) {
 }
 Info "installed to: $installDir"
 
-# ---------- 6. Provision WSL (visible output) ----------
-Step "Provisioning WSL (this can take several minutes on a fresh machine)"
-Info "Downloads ~150 MB if Ubuntu isn't already installed. Apt installs ~50 MB more."
-Info "All output streams live below; no silent waiting:"
-Write-Host ""
-# Resolve the running PowerShell's own exe by absolute path. A bare
-# `powershell.exe` failed with CommandNotFoundException on machines whose
-# elevated session PATH doesn't include System32. (Get-Process -Id $PID).Path
-# is always the full path to the host we're already running under.
-$psHost = (Get-Process -Id $PID).Path
-if (-not $psHost) { $psHost = Join-Path $PSHOME 'powershell.exe' }
-& $psHost -NoProfile -ExecutionPolicy Bypass -File "$installDir\wslprovision.ps1"
-$rc = $LASTEXITCODE
-if ($rc -ne 0) {
-    Warn "wslprovision.ps1 exited with $rc - you can re-run it later from an elevated shell:"
-    Info "    & `"$installDir\wslprovision.ps1`""
+# ---------- 6. Docker prerequisite ----------
+Step "Checking Docker Desktop"
+$docker = Get-Command docker.exe -ErrorAction SilentlyContinue
+if (-not $docker) {
+    Warn "Install Docker Desktop with Linux containers before running vpn up."
+    Info "https://docs.docker.com/desktop/setup/install/windows-install/"
+} else {
+    & $docker.Source info --format '{{.OSType}}'
+    if ($LASTEXITCODE -ne 0) { Warn "Start Docker Desktop before running vpn up." }
 }
+Info "This installer does not install or reconfigure a WSL distro."
+Info "The Windows routing service is prepared by vpn up with UAC. Installation never authenticates."
 
 # ---------- 7. First-run configuration wizard ----------
 Step "Configuring (interactive)"
@@ -204,7 +183,7 @@ if ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]') {
 Step "Done."
 Info "Try: vpn up        (brings the tunnel up)"
 Info "     vpn status    (health check)"
-Info "     Start Menu -> wsl-vpn-router  (launches the tray)"
+Info "     Start Menu -> Split VPN Router  (launches the tray)"
 Info ""
 Info "Re-running this installer upgrades in place. See 'vpn upgrade' for the in-app path."
 Write-Host ""

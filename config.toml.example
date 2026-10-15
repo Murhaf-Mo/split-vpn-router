@@ -1,24 +1,25 @@
-# Copy this file to config.toml and fill in your values.
-# config.toml is .gitignored on purpose — it holds plaintext secrets.
-
+# Copy to config.toml. Credentials remain local and are never included in Docker images.
 [vpn]
 host = "vpn.example.com"
 user = "your-username"
 password = "your-vpn-password"
-# group = "MFA-GROUP-NAME"   # uncomment if your server demands a group
+group = ""
+# Blank uses the corporate DNS addresses provided by the VPN server.
+dns_server = ""
+# Reconnect transport with the existing session only. Never repeat MFA/password login.
+auto_reconnect = false
 
-[wsl]
-distro = "Ubuntu-20.04"
-# Sudo password for launching openconnect inside WSL.
-# Leave empty if you set up a NOPASSWD sudoers rule (see README "Security").
-sudo_password = "your-wsl-sudo-password"
-
-[proxy]
-http_port = 8888    # tinyproxy
-pac_port  = 8889    # PAC server
-bind_addr = "0.0.0.0"
+[docker]
+image = "split-vpn-router:local"
+api_port = 8889
+relay_port = 1080
 
 [routing]
-# "vpn-default"    : everything -> VPN, direct.list entries -> home
-# "direct-default" : everything -> home, vpn.list entries -> VPN
-mode = "vpn-default"
+# Pause outbound-adapter IP forwarding while routing, then restore it on stop/crash.
+# Opt in if Windows reports a forwarding conflict (hotspot/router use may pause).
+manage_forwarding = false
+# direct-default: home network unless vpn.list matches.
+# vpn-default: VPN unless direct.list matches. VPN rules always take precedence.
+mode = "direct-default"
+# Home/public resolver used for direct destinations. Set to your LAN DNS if required.
+direct_dns = "1.1.1.1"

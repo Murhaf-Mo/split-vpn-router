@@ -1,4 +1,4 @@
-// vpn — Windows-side controller for the WSL-backed PAC + OpenConnect setup.
+// vpn — Windows-side controller for the Docker VPN runtime and native Windows TUN router.
 //
 // One binary, two modes:
 //   - CLI:  `vpn up`, `vpn status`, etc. (the same verb surface vpn.ps1 had)
@@ -8,10 +8,14 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 
+	"github.com/vpn/controller/internal/backend"
 	"github.com/vpn/controller/internal/cli"
 	"github.com/vpn/controller/internal/release"
+	"github.com/vpn/controller/internal/router"
 	"github.com/vpn/controller/internal/tray"
+	"github.com/vpn/controller/internal/winproxy"
 )
 
 func main() {
@@ -25,6 +29,45 @@ func main() {
 	// help / version / configure run BEFORE LoadEnv so they work even when
 	// no config.toml exists yet (fresh install path).
 	switch verb {
+	case "down":
+		exitOnErr(cli.EmergencyDown())
+		return
+	case "router-service", "router-prepare":
+		if len(args) != 2 || args[0] != "--data-dir" {
+			exitOnErr(fmt.Errorf("--data-dir is required"))
+			return
+		}
+		if verb == "router-service" {
+			exitOnErr(router.Serve(args[1]))
+		} else {
+			exitOnErr(router.Prepare(args[1]))
+		}
+		return
+	case "router-uninstall":
+		exitOnErr(router.Remove())
+		return
+	case "router-watchdog":
+		if len(args) != 1 {
+			exitOnErr(fmt.Errorf("forwarding recovery lease is required"))
+			return
+		}
+		exitOnErr(router.WatchForwarding(args[0]))
+		return
+	case "router-signal":
+		if len(args) != 1 {
+			exitOnErr(fmt.Errorf("routing child PID is required"))
+			return
+		}
+		pid, err := strconv.ParseUint(args[0], 10, 32)
+		if err != nil {
+			exitOnErr(err)
+			return
+		}
+		exitOnErr(router.SignalChild(uint32(pid)))
+		return
+	case "repair-proxy":
+		exitOnErr(winproxy.CleanupLegacy())
+		return
 	case "help", "--help", "-h":
 		cli.Usage()
 		return
@@ -56,6 +99,8 @@ func main() {
 		exitOnErr(cli.Down(env))
 	case "restart":
 		exitOnErr(cli.Restart(env))
+	case "build-image":
+		exitOnErr(backend.Build(env.InstallDir, env.Cfg))
 	case "status":
 		exitOnErr(cli.Status(env))
 	case "mode":

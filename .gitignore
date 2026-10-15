@@ -1,5 +1,6 @@
 # Plaintext credentials — local only.
 config.toml
+legacy-proxy-backup.json
 
 # Runtime artifacts (regenerated on each `vpn up`)
 runtime/
@@ -13,6 +14,9 @@ tinyproxy.conf
 # Built binaries — produced by ./build.ps1
 vpn.exe
 vpn-tray.exe
+sing-box.exe
+libcronet.dll
+sing-box-LICENSE.txt
 
 # MSI build artifacts (produced by `wix build` locally or in CI staging)
 *.msi

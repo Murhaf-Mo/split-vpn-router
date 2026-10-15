@@ -1,12 +1,12 @@
 # vpn.list - hosts ALWAYS routed through the VPN (never DIRECT).
 # Applies in BOTH modes; takes precedence over direct.list.
-# Edits take effect within ~1 second.
+# Edits are watched by the active Windows routing service; existing sockets may reconnect.
 #
 # Entry shapes:
 #   sourcecontrol.diyarme.com       plain host
 #   *.diyarme.com                   wildcard
 #   10.77.0.0/16                    CIDR
-#   https://api.diyarme.com/v1/*    URL pattern
+#   https://api.diyarme.com/v1/*    URL (routes the entire host)
 
 # === Diyarme corporate (extracted from Windows hosts file) ===
 *.diyarme.com

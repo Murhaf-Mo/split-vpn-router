@@ -20,7 +20,7 @@ import (
 // Repo points at the canonical GitHub repository. Hard-coded because the
 // release pipeline writes asset names that depend on the repo path, and we
 // want all updates to come from one place (no third-party mirroring).
-const Repo = "Murhaf-Mo/wsl-vpn-router"
+const Repo = "Murhaf-Mo/split-vpn-router"
 
 // localVersion is stamped by the release build via:
 //   go build -ldflags "-X github.com/vpn/controller/internal/release.localVersion=v1.2.3" ...

@@ -1,214 +1,211 @@
-// Package winproxy owns all the Windows-side knobs that the daemon can't
-// touch from inside WSL: the AutoConfigURL registry value, the User-scope
-// HTTP_PROXY/HTTPS_PROXY/NO_PROXY env vars, WinINet refresh, and the
-// system-wide settings broadcast.
+// Package winproxy only repairs proxy settings left by the legacy version.
+// Native TUN routing does not install PAC, environment variables or Git proxies.
 package winproxy
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/netip"
+	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
 
+	"github.com/BurntSushi/toml"
+	"github.com/vpn/controller/internal/platform"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
-const (
-	internetSettingsKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	environmentKey      = `Environment`
+const internetSettingsKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+const environmentKey = `Environment`
 
-	// WinINet InternetSetOption codes.
-	internetOptionSettingsChanged = 39
-	internetOptionRefresh         = 37
-)
-
-// SetAutoConfigURL writes HKCU\...\Internet Settings\AutoConfigURL and
-// notifies WinINet so browsers/apps pick it up immediately.
-func SetAutoConfigURL(url string) error {
-	k, _, err := registry.CreateKey(registry.CURRENT_USER, internetSettingsKey, registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer k.Close()
-	if err := k.SetStringValue("AutoConfigURL", url); err != nil {
-		return err
-	}
-	return notifyWinINet()
-}
-
-// ClearAutoConfigURL removes the value and notifies WinINet.
-func ClearAutoConfigURL() error {
-	k, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.SET_VALUE)
-	if err != nil {
-		if err == registry.ErrNotExist {
-			return nil
-		}
-		return err
-	}
-	defer k.Close()
-	_ = k.DeleteValue("AutoConfigURL")
-	return notifyWinINet()
-}
-
-// GetAutoConfigURL returns the current value, or "" if not set.
 func GetAutoConfigURL() string {
-	k, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.QUERY_VALUE)
-	if err != nil {
+	k, e := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.QUERY_VALUE)
+	if e != nil {
 		return ""
 	}
 	defer k.Close()
-	v, _, err := k.GetStringValue("AutoConfigURL")
-	if err != nil {
-		return ""
-	}
-	return v
+	s, _, _ := k.GetStringValue("AutoConfigURL")
+	return s
 }
 
-// SetProxyEnv sets HTTP_PROXY / HTTPS_PROXY / NO_PROXY at User scope and
-// broadcasts WM_SETTINGCHANGE so new processes pick them up. Also writes
-// git's http.proxy / https.proxy globals for git CLIs that don't honor env.
-func SetProxyEnv(proxyURL, noProxy string) error {
-	if err := setUserEnv("HTTP_PROXY", proxyURL); err != nil {
-		return err
+func legacyProxy(value, host, port string) bool {
+	u, err := url.Parse(value)
+	if err != nil || host == "" || u.User != nil || u.Scheme != "http" || u.Port() != port || (u.Path != "" && u.Path != "/") {
+		return false
 	}
-	if err := setUserEnv("HTTPS_PROXY", proxyURL); err != nil {
-		return err
-	}
-	if err := setUserEnv("NO_PROXY", noProxy); err != nil {
-		return err
-	}
-	if err := broadcastEnvChange(); err != nil {
-		return err
-	}
-	// Best-effort git config (silently ignore if git missing).
-	_ = exec.Command("git", "config", "--global", "http.proxy", proxyURL).Run()
-	_ = exec.Command("git", "config", "--global", "https.proxy", proxyURL).Run()
-	return nil
+	ip, err := netip.ParseAddr(u.Hostname())
+	return err == nil && ip.IsPrivate() && u.Hostname() == host
 }
 
-// ClearProxyEnv removes the three env vars and the git http/https proxy.
-func ClearProxyEnv() error {
-	_ = deleteUserEnv("HTTP_PROXY")
-	_ = deleteUserEnv("HTTPS_PROXY")
-	_ = deleteUserEnv("NO_PROXY")
-	_ = broadcastEnvChange()
-	_ = exec.Command("git", "config", "--global", "--unset", "http.proxy").Run()
-	_ = exec.Command("git", "config", "--global", "--unset", "https.proxy").Run()
-	return nil
-}
-
-// ---- helpers ----
-
-func setUserEnv(name, value string) error {
-	k, _, err := registry.CreateKey(registry.CURRENT_USER, environmentKey, registry.SET_VALUE)
+func CleanupLegacy() error {
+	data, err := platform.DataDir()
 	if err != nil {
 		return err
 	}
-	defer k.Close()
-	return k.SetStringValue(name, value)
-}
-
-func deleteUserEnv(name string) error {
-	k, err := registry.OpenKey(registry.CURRENT_USER, environmentKey, registry.SET_VALUE)
-	if err != nil {
-		if err == registry.ErrNotExist {
-			return nil
+	// Checkout builds can migrate settings left by an installed old release.
+	if _, err := os.Stat(filepath.Join(data, "runtime", "wsl-keepalive.pid")); err != nil {
+		body, _ := os.ReadFile(filepath.Join(data, "config.toml"))
+		if !strings.Contains(string(body), "[wsl]") {
+			profile := filepath.Join(os.Getenv("LOCALAPPDATA"), platform.AppDirName)
+			if _, err := os.Stat(filepath.Join(profile, "runtime", "wsl-keepalive.pid")); err == nil {
+				data = profile
+			} else {
+				oldConfig, _ := os.ReadFile(filepath.Join(profile, "config.toml"))
+				if strings.Contains(string(oldConfig), "[wsl]") {
+					data = profile
+				}
+			}
 		}
+	}
+	marker := false
+	if _, err := os.Stat(filepath.Join(data, "runtime", "wsl-keepalive.pid")); err == nil {
+		marker = true
+	}
+	var old struct {
+		WSL   map[string]any `toml:"wsl"`
+		Proxy struct {
+			HTTP int `toml:"http_port"`
+			PAC  int `toml:"pac_port"`
+		} `toml:"proxy"`
+	}
+	_, _ = toml.DecodeFile(filepath.Join(data, "config.toml"), &old)
+	if !marker && old.WSL == nil {
+		return nil
+	}
+	httpPort, pacPort := "8888", "8889"
+	if old.Proxy.HTTP != 0 {
+		httpPort = strconv.Itoa(old.Proxy.HTTP)
+	}
+	if old.Proxy.PAC != 0 {
+		pacPort = strconv.Itoa(old.Proxy.PAC)
+	}
+	pac := GetAutoConfigURL()
+	host := ""
+	ownPAC := false
+	if u, err := url.Parse(pac); err == nil && u.Scheme == "http" && u.User == nil && u.Path == "/proxy.pac" && u.Port() == pacPort {
+		if ip, err := netip.ParseAddr(u.Hostname()); err == nil && ip.IsPrivate() {
+			host = u.Hostname()
+			ownPAC = true
+		}
+	}
+	if host == "" {
+		body, _ := os.ReadFile(filepath.Join(data, "runtime", "pac.log"))
+		matches := regexp.MustCompile(`PAC will return PROXY ([0-9.]+):([0-9]+)`).FindAllStringSubmatch(string(body), -1)
+		if len(matches) > 0 {
+			last := matches[len(matches)-1]
+			if ip, err := netip.ParseAddr(last[1]); err == nil && ip.IsPrivate() {
+				host = last[1]
+				httpPort = last[2]
+			}
+		}
+	}
+	if !ownPAC && !marker {
+		return nil
+	}
+	backups := map[string]string{}
+	if ownPAC {
+		backups["AutoConfigURL"] = pac
+	}
+	environment, err := registry.OpenKey(registry.CURRENT_USER, environmentKey, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil && err != registry.ErrNotExist {
 		return err
 	}
-	defer k.Close()
-	_ = k.DeleteValue(name)
+	if err == nil {
+		defer environment.Close()
+		proxyOwned := false
+		for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY"} {
+			value, _, _ := environment.GetStringValue(name)
+			if legacyProxy(value, host, httpPort) {
+				backups[name] = value
+				proxyOwned = true
+			}
+		}
+		if proxyOwned {
+			value, _, _ := environment.GetStringValue("NO_PROXY")
+			list, _ := os.ReadFile(filepath.Join(data, "direct.list"))
+			var expected []string
+			for _, line := range strings.Split(string(list), "\n") {
+				line, _, _ = strings.Cut(line, "#")
+				line = strings.TrimSpace(line)
+				if line == "" || strings.Contains(line, "://") {
+					continue
+				}
+				line = strings.TrimPrefix(line, "*")
+				expected = append(expected, line)
+			}
+			if value != "" && value == strings.Join(expected, ",") {
+				backups["NO_PROXY"] = value
+			}
+		}
+	}
+	for _, key := range []string{"http.proxy", "https.proxy"} {
+		out, err := exec.Command("git", "config", "--global", "--get", key).Output()
+		value := strings.TrimSpace(string(out))
+		if err == nil && legacyProxy(value, host, httpPort) {
+			backups["git."+key] = value
+		}
+	}
+	if len(backups) == 0 {
+		return nil
+	}
+	// Preserve the actual values removed. Never overwrite an earlier migration backup.
+	backup := filepath.Join(data, "legacy-proxy-backup.json")
+	if _, err := os.Stat(backup); os.IsNotExist(err) {
+		b, _ := json.MarshalIndent(backups, "", "  ")
+		if err := os.WriteFile(backup, b, 0600); err != nil {
+			return err
+		}
+	}
+	if ownPAC {
+		k, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.SET_VALUE)
+		if err != nil {
+			return err
+		}
+		err = k.DeleteValue("AutoConfigURL")
+		k.Close()
+		if err != nil {
+			return err
+		}
+	}
+	for name := range backups {
+		if name == "HTTP_PROXY" || name == "HTTPS_PROXY" || name == "NO_PROXY" {
+			if err := environment.DeleteValue(name); err != nil {
+				return err
+			}
+			if name != "NO_PROXY" {
+				_ = os.Unsetenv(name)
+			}
+		}
+		if strings.HasPrefix(name, "git.") {
+			key := strings.TrimPrefix(name, "git.")
+			pattern := "^" + regexp.QuoteMeta(backups[name]) + "$"
+			if out, err := exec.Command("git", "config", "--global", "--unset-all", key, pattern).CombinedOutput(); err != nil {
+				return fmt.Errorf("removing legacy Git proxy: %w: %s", err, out)
+			}
+		}
+	}
+	notifyWinINet()
+	broadcastEnvChange()
+	fmt.Println("Removed recognized legacy proxy settings; backup:", backup)
+	fmt.Println("Apps already holding the old proxy in memory may need one restart during migration.")
 	return nil
 }
 
-// BuildNoProxy concatenates direct.list entries into a NO_PROXY string.
-// Patterns starting with "*." get the leading "*" stripped (so "*.example.com"
-// becomes ".example.com" which env-var-honoring tools match correctly).
-// Lines starting with http(s):// are skipped — env NO_PROXY doesn't model
-// path-based bypass.
-func BuildNoProxy(directListEntries []string) string {
-	var out []string
-	for _, raw := range directListEntries {
-		line := raw
-		if i := strings.Index(line, "#"); i >= 0 {
-			line = line[:i]
-		}
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
-			continue
-		}
-		if strings.HasPrefix(line, "*.") {
-			line = line[1:]
-		}
-		out = append(out, line)
-	}
-	return strings.Join(out, ",")
+func notifyWinINet() {
+	dll := syscall.NewLazyDLL("wininet.dll")
+	p := dll.NewProc("InternetSetOptionW")
+	p.Call(0, 39, 0, 0)
+	p.Call(0, 37, 0, 0)
 }
-
-// ---- WinINet + broadcast (syscall) ----
-
-var (
-	winInet                        = syscall.NewLazyDLL("wininet.dll")
-	procInternetSetOptionW         = winInet.NewProc("InternetSetOptionW")
-	user32                         = syscall.NewLazyDLL("user32.dll")
-	procSendMessageTimeoutW        = user32.NewProc("SendMessageTimeoutW")
-)
-
-const (
-	hwndBroadcast   = uintptr(0xffff)
-	wmSettingChange = uintptr(0x001A)
-	smtoAbortIfHung = uintptr(0x0002)
-)
-
-func notifyWinINet() error {
-	// SETTINGS_CHANGED
-	r1, _, e := procInternetSetOptionW.Call(0, internetOptionSettingsChanged, 0, 0)
-	if r1 == 0 && e != nil && e.Error() != "The operation completed successfully." {
-		// non-fatal
-	}
-	// REFRESH (re-fetch the PAC file)
-	r1, _, e = procInternetSetOptionW.Call(0, internetOptionRefresh, 0, 0)
-	if r1 == 0 && e != nil && e.Error() != "The operation completed successfully." {
-		// non-fatal
-	}
-	return nil
-}
-
-// broadcastEnvChange tells other Windows processes that environment vars
-// have changed (HWND_BROADCAST, WM_SETTINGCHANGE, lParam="Environment").
-// Without this, only NEW processes pick up SetUserEnv changes; with it,
-// at least Explorer-spawned children get the update.
-func broadcastEnvChange() error {
-	target, err := windows.UTF16PtrFromString("Environment")
-	if err != nil {
-		return err
-	}
-	var out uintptr
-	procSendMessageTimeoutW.Call(
-		hwndBroadcast,
-		wmSettingChange,
-		0,
-		uintptr(unsafe.Pointer(target)),
-		smtoAbortIfHung,
-		5000,
-		uintptr(unsafe.Pointer(&out)),
-	)
-	return nil
-}
-
-// PrintProxyEnv prints the User-scope values for diagnostics.
-func PrintProxyEnv() string {
-	k, err := registry.OpenKey(registry.CURRENT_USER, environmentKey, registry.QUERY_VALUE)
-	if err != nil {
-		return ""
-	}
-	defer k.Close()
-	var b strings.Builder
-	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} {
-		v, _, _ := k.GetStringValue(name)
-		fmt.Fprintf(&b, "%s=%s\n", name, v)
-	}
-	return b.String()
+func broadcastEnvChange() {
+	target, _ := windows.UTF16PtrFromString("Environment")
+	var result uintptr
+	syscall.NewLazyDLL("user32.dll").NewProc("SendMessageTimeoutW").Call(0xffff, 0x1a, 0, uintptr(unsafe.Pointer(target)), 2, 5000, uintptr(unsafe.Pointer(&result)))
 }

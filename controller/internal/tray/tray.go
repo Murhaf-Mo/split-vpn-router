@@ -18,6 +18,7 @@ import (
 	"github.com/vpn/controller/internal/api"
 	"github.com/vpn/controller/internal/cli"
 	"github.com/vpn/controller/internal/release"
+	"github.com/vpn/controller/internal/router"
 )
 
 // updateCheckInterval is how often the tray polls GitHub for a newer release.
@@ -44,7 +45,6 @@ var iconOff []byte
 
 var (
 	env        *cli.Env
-	lastIP     atomic.Value // string
 	currentIcn atomic.Value // string — which icon is loaded
 	lastMode   atomic.Value // string — last seen mode
 )
@@ -73,7 +73,7 @@ func onReady() {
 	modeToggle := systray.AddMenuItem("Switch mode", "Flip between vpn-default and direct-default")
 
 	systray.AddSeparator()
-	upItem := systray.AddMenuItem("Up", "Bring tunnel + proxy up")
+	upItem := systray.AddMenuItem("Up", "Connect VPN and start Windows routing")
 	downItem := systray.AddMenuItem("Down", "Tear down")
 	restartItem := systray.AddMenuItem("Restart", "Down then up")
 
@@ -82,7 +82,7 @@ func onReady() {
 	quitItem := systray.AddMenuItem("Quit", "Exit the tray (does NOT bring VPN down)")
 
 	systray.AddSeparator()
-	verItem := systray.AddMenuItem("version "+release.LocalVersion(), "wsl-vpn-router version")
+	verItem := systray.AddMenuItem("version "+release.LocalVersion(), "Split VPN Router version")
 	verItem.Disable()
 
 	// Status poller — updates icon, status row, mode-toggle label.
@@ -140,11 +140,7 @@ func switchMode() error {
 // ---- status rendering ----
 
 func pollStatus() (*api.Status, error) {
-	ip, _ := lastIP.Load().(string)
-	if ip == "" {
-		ip = "127.0.0.1"
-	}
-	return api.New(ip, env.Cfg.PACPort).Quick().Status()
+	return cli.Client(env).Quick().Status()
 }
 
 func renderStatus(statusRow, modeToggle *systray.MenuItem, s *api.Status, err error) {
@@ -156,7 +152,6 @@ func renderStatus(statusRow, modeToggle *systray.MenuItem, s *api.Status, err er
 		modeToggle.Disable()
 		return
 	}
-	lastIP.Store(s.WSLIp)
 	lastMode.Store(s.Mode)
 	modeToggle.Enable()
 
@@ -167,18 +162,22 @@ func renderStatus(statusRow, modeToggle *systray.MenuItem, s *api.Status, err er
 	modeToggle.SetTitle("Switch to " + other)
 
 	switch {
-	case s.Tun0IP != "" && s.TinyproxyPid > 0:
+	case s.ConnectionState == "connected" && router.ReadStatus().Active:
 		setIcon("connected")
 		statusRow.SetTitle(fmt.Sprintf("● %s · %s", s.Tun0IP, s.Mode))
-		systray.SetTooltip(fmt.Sprintf("vpn — connected (%s)\nproxy %s:%d", s.Mode, s.WSLIp, s.ProxyPort))
-	case s.TinyproxyPid > 0:
+		systray.SetTooltip(fmt.Sprintf("vpn — connected (%s)\nrelay %s:%d", s.Mode, s.ProxyHost, s.ProxyPort))
+	case s.ConnectionState == "connecting":
 		setIcon("warn")
-		statusRow.SetTitle("● tunnel down · " + s.Mode)
-		systray.SetTooltip("vpn — proxy up, tunnel down")
+		statusRow.SetTitle("● waiting for authentication")
+		systray.SetTooltip("vpn — waiting for your explicit connection attempt")
+	case s.ConnectionState == "connected":
+		setIcon("warn")
+		statusRow.SetTitle("● Windows router inactive")
+		systray.SetTooltip("vpn — tunnel connected; Windows routing needs attention")
 	default:
-		setIcon("warn")
-		statusRow.SetTitle("○ partial")
-		systray.SetTooltip("vpn — partially up")
+		setIcon("off")
+		statusRow.SetTitle("○ disconnected · reconnect manually")
+		systray.SetTooltip("vpn — " + s.Error)
 	}
 }
 
@@ -210,6 +209,9 @@ func runVerb(label string, fn func() error) {
 // Persists the last-check timestamp under DataDir/.update-check so multiple
 // tray sessions in a day don't exhaust the unauthenticated API rate limit.
 func updateChecker(item *systray.MenuItem) {
+	if release.LocalVersion() == "dev" {
+		return // A published release can predate the architecture in this checkout.
+	}
 	// Honour previous-session check time so we don't probe immediately if
 	// another tray instance already checked within the window.
 	if last := readLastCheck(); time.Since(last) < updateCheckInterval {
@@ -236,7 +238,7 @@ func checkOnce(item *systray.MenuItem) {
 		return
 	}
 	item.SetTitle(fmt.Sprintf("↑ Update to %s", remote))
-	item.SetTooltip(fmt.Sprintf("Download and install wsl-vpn-router %s (current: %s)", remote, local))
+	item.SetTooltip(fmt.Sprintf("Download and install Split VPN Router %s (current: %s)", remote, local))
 	item.Show()
 }
 

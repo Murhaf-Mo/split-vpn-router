@@ -1,1133 +1,452 @@
 #!/usr/bin/env python3
-"""
-vpnctl.py — runs inside WSL. Brings up openconnect + tinyproxy and serves a
-hot-reloading PAC file plus a JSON REST API and a dashboard SPA on :PAC_PORT.
-Watches vpn.list / direct.list for file-mtime changes and reloads transparently.
-
-Invoked by vpn.exe (the Windows-side controller) via `wsl -d <distro> ...`.
-The dashboard lives at /, the REST API under /api/, and the legacy PAC URL at
-/proxy.pac.
-
-Single file, stdlib only (Python 3.8 compatible).
-"""
+"""Docker VPN daemon. Only an explicit POST /api/connect authenticates."""
+import contextlib
+import hmac
+import ipaddress
 import json
 import os
-import re
+from pathlib import Path
 import shlex
 import signal
+import socket
 import subprocess
-import sys
 import threading
 import time
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
-# INSTALL_DIR holds read-only assets shipped by the MSI: vpnctl.py itself and
-# static/ (the dashboard). It's always the directory containing this script.
-INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(INSTALL_DIR, "static")
-
-
-def _resolve_data_dir():
-    """Pick the writable per-user directory holding config + lists + runtime/.
-
-    Resolution order (first hit wins):
-      1. `--data-dir <path>` on argv  (how vpn.exe launches us)
-      2. $VPN_DATA_DIR env var
-      3. $XDG_RUNTIME_DIR/wsl-vpn-router  (not used by Windows-side launcher
-         but lets the daemon be run by hand inside WSL for debugging)
-      4. INSTALL_DIR  (pre-1.0 single-directory layout; what dev-mode
-         vpn.exe falls back to when no MSI is installed)
-    """
-    argv = sys.argv
-    for i, a in enumerate(argv):
-        if a == "--data-dir" and i + 1 < len(argv):
-            return os.path.abspath(argv[i + 1])
-        if a.startswith("--data-dir="):
-            return os.path.abspath(a.split("=", 1)[1])
-    if os.environ.get("VPN_DATA_DIR"):
-        return os.path.abspath(os.environ["VPN_DATA_DIR"])
-    return INSTALL_DIR
+INSTALL_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("VPN_DATA_DIR", "/data"))
+RUNTIME = DATA_DIR / "runtime"
+RUNTIME.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = DATA_DIR / "config.toml"
+LOG_PATHS = {name: RUNTIME / (name + ".log") for name in ("oc", "pac", "proxy")}
+LOCK = threading.RLock()
+STATE = {"connection_state": "disconnected", "error": "", "oc_pid": 0, "relay_pid": 0}
+TUNNEL = AUTH = RELAY = None
+CANCEL = threading.Event()
+WORKER = None
 
 
-DATA_DIR = _resolve_data_dir()
-os.makedirs(DATA_DIR, exist_ok=True)
-
-CONFIG_PATH = os.path.join(DATA_DIR, "config.toml")
-DIRECT_PATH = os.path.join(DATA_DIR, "direct.list")
-VPN_LIST_PATH = os.path.join(DATA_DIR, "vpn.list")
-
-# Runtime artifacts (logs, pid files, generated tinyproxy.conf) live under
-# RUNTIME_DIR. Created here so cleanup paths exist before the daemon's first run.
-RUNTIME_DIR = os.path.join(DATA_DIR, "runtime")
-os.makedirs(RUNTIME_DIR, exist_ok=True)
-
-TINYPROXY_CONF = f"{RUNTIME_DIR}/tinyproxy.conf"
-OC_PID = f"{RUNTIME_DIR}/oc.pid"
-OC_LOG = f"{RUNTIME_DIR}/oc.log"
-TP_PID = "/tmp/tinyproxy.pid"
-TP_LOG = "/tmp/tinyproxy.log"
-TP_PID_MIRROR = f"{RUNTIME_DIR}/proxy.pid"
-TP_LOG_MIRROR = f"{RUNTIME_DIR}/proxy.log"
-PAC_PID = f"{RUNTIME_DIR}/pac.pid"
-PAC_LOG = f"{RUNTIME_DIR}/pac.log"
-
-LOG_PATHS = {"oc": OC_LOG, "pac": PAC_LOG, "proxy": TP_LOG_MIRROR}
-
-
-def _resolve_version():
-    """Version string, surfaced in /api/status and the dashboard header.
-
-    vpn.exe passes `--version X.Y.Z` when launching the daemon (it knows its
-    own ldflags-stamped version). Falls back to $VPN_VERSION, then "dev".
-    """
-    argv = sys.argv
-    for i, a in enumerate(argv):
-        if a == "--version" and i + 1 < len(argv):
-            return argv[i + 1]
-        if a.startswith("--version="):
-            return a.split("=", 1)[1]
-    return os.environ.get("VPN_VERSION", "dev")
-
-
-DAEMON_VERSION = _resolve_version()
-
-# Module-level lock to serialize list-file writes across HTTP threads.
-_lists_write_lock = threading.Lock()
-
-
-def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
-    sys.stdout.write(line)
-    sys.stdout.flush()
-
-
-# ---------- Minimal TOML parser (handles our simple config) ----------
-def parse_toml(text):
-    cfg, section = {}, None
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip()
-            cfg.setdefault(section, {})
-            continue
-        if "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if v.startswith('"') and v.endswith('"'):
-            v = v[1:-1]
-        elif v.lower() in ("true", "false"):
-            v = v.lower() == "true"
-        else:
-            try:
-                v = int(v)
-            except ValueError:
-                pass
-        if section:
-            cfg[section][k] = v
-    return cfg
+def event(message):
+    text = time.strftime("[%H:%M:%S] ") + str(message)
+    with contextlib.suppress(OSError):
+        print(text, flush=True)
+        with LOG_PATHS["pac"].open("a", encoding="utf-8") as stream:
+            stream.write(text + "\n")
 
 
 def load_config():
-    with open(CONFIG_PATH) as f:
-        return parse_toml(f.read())
+    with CONFIG_PATH.open("rb") as stream:
+        return tomllib.load(stream)
 
 
-# ---------- routing list parsing ----------
-class Rules:
-    def __init__(self, path, label):
-        self.path = path
-        self.label = label
-        self.domains = []  # list[str]   shell-pattern host
-        self.cidrs = []  # list[(net_str, mask_str)]  for PAC isInNet
-        self.urls = []  # list[str]   shell-pattern url
-        self.mtime = 0
-        self.lock = threading.Lock()
-        self.last_reload = 0
-
-    @staticmethod
-    def cidr_to_mask(prefix):
-        bits = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
-        return ".".join(str((bits >> (8 * (3 - i))) & 0xFF) for i in range(4))
-
-    def parse(self, text):
-        domains, cidrs, urls = [], [], []
-        for raw in text.splitlines():
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            if "://" in line or line.endswith("/*") or "/*" in line:
-                urls.append(line)
-                continue
-            m = re.match(r"^(\d+\.\d+\.\d+\.\d+)(?:/(\d+))?$", line)
-            if m:
-                ip = m.group(1)
-                prefix = int(m.group(2)) if m.group(2) else 32
-                cidrs.append((ip, self.cidr_to_mask(prefix)))
-                continue
-            if ":" in line:  # ipv6 - skip in PAC
-                continue
-            domains.append(line)
-        return domains, cidrs, urls
-
-    def reload_if_changed(self):
-        try:
-            mt = os.stat(self.path).st_mtime
-        except FileNotFoundError:
-            with self.lock:
-                if self.mtime != 0:
-                    self.domains, self.cidrs, self.urls = [], [], []
-                    self.mtime = 0
-            return False
-        if mt == self.mtime:
-            return False
-        with open(self.path) as f:
-            text = f.read()
-        d, c, u = self.parse(text)
-        with self.lock:
-            self.domains, self.cidrs, self.urls = d, c, u
-            self.mtime = mt
-            self.last_reload = time.time()
-        log(f"{self.label} reloaded: {len(d)} domains, {len(c)} cidrs, {len(u)} urls")
-        return True
-
-    def snapshot(self):
-        with self.lock:
-            return list(self.domains), list(self.cidrs), list(self.urls)
+def entries(which):
+    path = DATA_DIR / (which + ".list")
+    if not path.exists():
+        return []
+    return [line.split("#", 1)[0].strip() for line in path.read_text(encoding="utf-8-sig").splitlines()
+            if line.split("#", 1)[0].strip()]
 
 
-DIRECT_RULES = Rules(DIRECT_PATH, "direct.list")
-VPN_RULES = Rules(VPN_LIST_PATH, "vpn.list")
-
-
-def get_eth0_ip():
-    """Returns the WSL VM's eth0 IPv4 (reachable from Windows host)."""
+def normalize_entry(value):
+    """A URL selects its host. Encrypted HTTPS paths cannot be packet-routing rules."""
+    value = value.strip().lower()
+    if "://" in value:
+        parsed = urlsplit(value)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("Use an HTTP(S) URL, domain, IP address or CIDR")
+        value = parsed.hostname
     try:
-        out = subprocess.check_output(
-            ["bash", "-c", "ip -4 -br addr show eth0 | awk '{print $3}' | cut -d/ -f1"],
-            text=True,
-        ).strip()
-        return out
-    except Exception:
-        return "127.0.0.1"
-
-
-def _emit_rules(parts, rules, action, need_dns_block):
-    domains, cidrs, urls = rules.snapshot()
-    for u in urls:
-        parts.append(f'  if (shExpMatch(url, {json.dumps(u)})) return {action};')
-    for d in domains:
-        d_l = d.lower()
-        if "*" in d_l or "?" in d_l:
-            parts.append(f'  if (shExpMatch(host, {json.dumps(d_l)})) return {action};')
-        else:
-            parts.append(f'  if (host == {json.dumps(d_l)} || dnsDomainIs(host, {json.dumps("." + d_l)})) return {action};')
-    if cidrs:
-        if not need_dns_block["emitted"]:
-            parts.append("  var ip = null;")
-            parts.append("  try { ip = dnsResolve(host); } catch(e) {}")
-            need_dns_block["emitted"] = True
-        parts.append("  if (ip) {")
-        for net, mask in cidrs:
-            parts.append(f'    if (isInNet(ip, "{net}", "{mask}")) return {action};')
-        parts.append("  }")
-
-
-def build_pac(proxy_host, proxy_port, mode):
-    proxy_action = f'"PROXY {proxy_host}:{proxy_port}"'
-    direct_action = '"DIRECT"'
-    default_action = direct_action if mode == "direct-default" else proxy_action
-
-    parts = []
-    parts.append(f"// mode={mode}")
-    parts.append("function FindProxyForURL(url, host) {")
-    parts.append("  host = host.toLowerCase();")
-    need_dns = {"emitted": False}
-    # Precedence: vpn.list (force VPN) wins over direct.list (force home),
-    # because corporate hosts pinned to VPN must never accidentally leak DIRECT.
-    _emit_rules(parts, VPN_RULES, proxy_action, need_dns)
-    _emit_rules(parts, DIRECT_RULES, direct_action, need_dns)
-    parts.append(f"  return {default_action};")
-    parts.append("}")
-    return "\n".join(parts) + "\n"
-
-
-def current_mode():
-    """Re-read config.toml each call so /proxy.pac reflects live mode."""
-    try:
-        with open(CONFIG_PATH) as f:
-            cfg = parse_toml(f.read())
-        m = cfg.get("routing", {}).get("mode", "vpn-default")
-        return m if m in ("vpn-default", "direct-default") else "vpn-default"
-    except Exception:
-        return "vpn-default"
-
-
-# ---------- Process management ----------
-def is_alive(pid_file):
-    try:
-        with open(pid_file) as f:
-            pid = int(f.read().strip())
-    except (FileNotFoundError, ValueError):
-        return 0
-    try:
-        os.kill(pid, 0)
-        return pid
-    except ProcessLookupError:
-        return 0
-    except PermissionError:
-        # process exists but we can't signal it (root-owned). Still "alive".
-        return pid
-
-
-def kill_pid_file(pid_file, with_sudo=False, sudo_pw=""):
-    pid = is_alive(pid_file)
-    if not pid:
-        return
-    try:
-        if with_sudo:
-            subprocess.run(
-                ["sudo", "-S", "kill", str(pid)],
-                input=sudo_pw + "\n", text=True, check=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except Exception as e:
-        log(f"kill {pid} failed: {e}")
-    try:
-        os.remove(pid_file)
-    except FileNotFoundError:
-        pass
-
-
-def _eth0_gateway():
-    """Heuristic: WSL's eth0 default gateway is the .1 host of the eth0
-    subnet (e.g., 172.23.58.50/20 → 172.23.48.1)."""
-    try:
-        out = subprocess.check_output(
-            ["ip", "-4", "-br", "addr", "show", "eth0"], text=True
-        ).split()
-        cidr = out[2]  # "172.23.58.50/20"
-        import ipaddress
-        net = ipaddress.IPv4Network(cidr, strict=False)
-        return str(net.network_address + 1)
-    except Exception:
-        return None
-
-
-def ensure_pre_vpn_network(sudo_pw):
-    """openconnect's vpnc-script rewrites /etc/resolv.conf, replaces the
-    default route, and reconfigures systemd-resolved. If openconnect dies
-    uncleanly (DPD, killed process, etc.) none of those get restored — so
-    on the next connect attempt DNS resolves against unreachable corp DNS,
-    or fails entirely with 'Network is unreachable' because the default
-    route is gone. Detect both failure modes and fix them in place."""
-    fixes = []
-
-    # 1. resolv.conf
-    try:
-        with open("/etc/resolv.conf") as f:
-            head = f.read(200)
-    except FileNotFoundError:
-        head = ""
-    resolv_dirty = "@VPNC_GENERATED@" in head
-
-    # 2. default route
-    try:
-        rt = subprocess.check_output(
-            ["ip", "-4", "route", "show", "default"], text=True
-        ).strip()
-    except Exception:
-        rt = ""
-    default_missing = not rt
-
-    if not resolv_dirty and not default_missing:
-        return
-
-    script_parts = []
-    if resolv_dirty:
-        fallback = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
-        script_parts.append(f"printf {shlex.quote(fallback)} > /etc/resolv.conf")
-        script_parts.append("resolvectl flush-caches 2>/dev/null")
-        script_parts.append("resolvectl revert eth0 2>/dev/null")
-        script_parts.append("systemctl restart systemd-resolved 2>/dev/null")
-        fixes.append("resolv.conf+resolved")
-    if default_missing:
-        gw = _eth0_gateway()
-        if gw:
-            script_parts.append(f"ip route add default via {gw} dev eth0 2>/dev/null")
-            fixes.append(f"default route via {gw}")
-        else:
-            fixes.append("default route missing (could not derive gateway)")
-    script_parts.append("true")
-    script = "; ".join(script_parts)
-
-    if sudo_pw:
-        full = f"echo {shlex.quote(sudo_pw)} | sudo -S bash -c {shlex.quote(script)}"
-    else:
-        full = f"sudo bash -c {shlex.quote(script)}"
-    subprocess.run(["bash", "-c", full], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    log("pre-vpn fixups: " + ", ".join(fixes))
-
-
-def start_openconnect(cfg):
-    if is_alive(OC_PID):
-        log(f"openconnect already running (pid {is_alive(OC_PID)})")
-        return
-    vpn = cfg["vpn"]
-    sudo_pw = cfg.get("wsl", {}).get("sudo_password", "")
-    ensure_pre_vpn_network(sudo_pw)
-    user = vpn["user"]
-    host = vpn["host"]
-    password = vpn["password"]
-    group = vpn.get("group", "")
-    extra = []
-    if group:
-        extra += ["--authgroup", group]
-    oc_cmd = (
-        "echo {pw} | setsid nohup openconnect "
-        "--user={user} --passwd-on-stdin --background "
-        "--pid-file={pid} {extra} {host} "
-        ">{log} 2>&1"
-    ).format(
-        pw=shlex.quote(password),
-        user=shlex.quote(user),
-        pid=shlex.quote(OC_PID),
-        extra=" ".join(shlex.quote(x) for x in extra),
-        host=shlex.quote(host),
-        log=shlex.quote(OC_LOG),
-    )
-    if sudo_pw:
-        full = f"echo {shlex.quote(sudo_pw)} | sudo -S bash -c {shlex.quote(oc_cmd)}"
-    else:
-        full = f"sudo bash -c {shlex.quote(oc_cmd)}"
-    log("starting openconnect")
-    subprocess.run(["bash", "-c", full], check=False)
-    # wait up to 15s for tun0 to appear
-    for _ in range(30):
-        if os.path.exists("/sys/class/net/tun0"):
-            log("tun0 is up")
-            ensure_mss_clamp(sudo_pw)
-            return
-        time.sleep(0.5)
-    log("WARNING: tun0 not detected after 15s — check oc.log")
-
-
-def ensure_mss_clamp(sudo_pw):
-    """Clamp TCP MSS to tun0's PMTU. Without this, TLS ClientHello packets
-    from proxied clients (Windows MTU 1500) get silently dropped when they
-    cross the openconnect tunnel (PMTU often ~1358), so TLS handshakes hang
-    until they time out."""
-    rules = [
-        "OUTPUT -o tun0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
-        "FORWARD -o tun0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu",
-    ]
-    cmds = []
-    for r in rules:
-        # idempotent: delete-if-present then add
-        cmds.append(f"iptables -t mangle -D {r} 2>/dev/null ; iptables -t mangle -A {r}")
-    script = " ; ".join(cmds)
-    if sudo_pw:
-        full = f"echo {shlex.quote(sudo_pw)} | sudo -S bash -c {shlex.quote(script)}"
-    else:
-        full = f"sudo bash -c {shlex.quote(script)}"
-    r = subprocess.run(["bash", "-c", full], capture_output=True, text=True)
-    if r.returncode == 0:
-        log("MSS clamp on tun0 installed")
-    else:
-        log(f"MSS clamp failed: {r.stderr.strip()}")
-
-
-def write_tinyproxy_conf(cfg):
-    port = cfg["proxy"]["http_port"]
-    bind = cfg["proxy"]["bind_addr"]
-    conf = f"""# generated by vpnctl.py - do not edit by hand
-# Stay as root: avoids drvfs permission edge-cases under privilege drop.
-User root
-Group root
-Port {port}
-Listen {bind}
-Timeout 600
-DefaultErrorFile "/usr/share/tinyproxy/default.html"
-StatFile "/usr/share/tinyproxy/stats.html"
-# Log+pid on a tmpfs path that tinyproxy can always open;
-# we tail-copy to /mnt/c/.../proxy.log from the PAC daemon for visibility.
-LogFile "/tmp/tinyproxy.log"
-LogLevel Info
-PidFile "/tmp/tinyproxy.pid"
-MaxClients 100
-StartServers 5
-MinSpareServers 5
-MaxSpareServers 20
-Allow 127.0.0.1
-Allow 10.0.0.0/8
-Allow 172.16.0.0/12
-Allow 192.168.0.0/16
-ViaProxyName "vpnctl"
-DisableViaHeader Yes
-# Allow CONNECT to all common TLS ports
-ConnectPort 443
-ConnectPort 563
-ConnectPort 8443
-"""
-    with open(TINYPROXY_CONF, "w") as f:
-        f.write(conf)
-
-
-def tinyproxy_pid():
-    try:
-        out = subprocess.check_output(["pgrep", "-x", "tinyproxy"], text=True).strip()
-        return int(out.splitlines()[0]) if out else 0
-    except (subprocess.CalledProcessError, ValueError):
-        return 0
-
-
-def start_tinyproxy(cfg):
-    if tinyproxy_pid():
-        log(f"tinyproxy already running (pid {tinyproxy_pid()})")
-        return
-    write_tinyproxy_conf(cfg)
-    sudo_pw = cfg.get("wsl", {}).get("sudo_password", "")
-    cmd = f"tinyproxy -c {shlex.quote(TINYPROXY_CONF)}"
-    if sudo_pw:
-        full = f"echo {shlex.quote(sudo_pw)} | sudo -S {cmd}"
-    else:
-        full = f"sudo {cmd}"
-    log("starting tinyproxy")
-    r = subprocess.run(["bash", "-c", full], capture_output=True, text=True)
-    if r.returncode != 0:
-        log(f"tinyproxy failed (rc={r.returncode}): {r.stderr.strip() or r.stdout.strip()}")
-        return
-    time.sleep(0.7)
-    pid = tinyproxy_pid()
-    log(f"tinyproxy pid {pid}")
-    if pid:
-        try:
-            with open(TP_PID_MIRROR, "w") as f:
-                f.write(str(pid))
-        except Exception:
-            pass
-
-
-def log_mirror_thread():
-    """Continuously copy /tmp/tinyproxy.log -> Desktop\\vpn\\proxy.log."""
-    last_size = 0
-    while True:
-        try:
-            if os.path.exists(TP_LOG):
-                sz = os.path.getsize(TP_LOG)
-                if sz != last_size:
-                    with open(TP_LOG, "rb") as src, open(TP_LOG_MIRROR, "wb") as dst:
-                        dst.write(src.read())
-                    last_size = sz
-        except Exception:
-            pass
-        time.sleep(2)
-
-
-# ---------- Mutation helpers ----------
-def set_config_mode(new_mode):
-    """Edit routing.mode in config.toml in place."""
-    if new_mode not in ("vpn-default", "direct-default"):
-        raise ValueError("mode must be 'vpn-default' or 'direct-default'")
-    with open(CONFIG_PATH) as f:
-        text = f.read()
-    if re.search(r"(?ms)^\s*\[routing\][^\[]*?^\s*mode\s*=", text):
-        text = re.sub(r"(?m)^\s*mode\s*=.*$", f'mode = "{new_mode}"', text)
-    elif re.search(r"(?m)^\s*\[routing\]", text):
-        text = re.sub(r"(?m)^\s*\[routing\].*$",
-                      f'[routing]\nmode = "{new_mode}"', text)
-    else:
-        text = text.rstrip() + f'\n\n[routing]\nmode = "{new_mode}"\n'
-    with open(CONFIG_PATH, "w") as f:
-        f.write(text)
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        if not value or any(c in value for c in "/\\\n\r\t #:@"):
+            raise ValueError("Invalid routing entry; use a full HTTP(S) URL for URL input")
+        return value
 
 
 def read_config_for_api():
-    """Return config.toml as a dict safe to send to the dashboard: actual
-    secret VALUES are never included, only booleans saying whether they're set.
-    """
     cfg = load_config()
     vpn = cfg.get("vpn", {})
-    wsl = cfg.get("wsl", {})
-    proxy = cfg.get("proxy", {})
-    routing = cfg.get("routing", {})
-    return {
-        "vpn": {
-            "host": vpn.get("host", ""),
-            "user": vpn.get("user", ""),
-            "group": vpn.get("group", ""),
-            "password_set": bool(vpn.get("password", "")),
-        },
-        "wsl": {
-            "distro": wsl.get("distro", ""),
-            "sudo_password_set": bool(wsl.get("sudo_password", "")),
-        },
-        "proxy": {
-            "http_port": proxy.get("http_port", 8888),
-            "pac_port": proxy.get("pac_port", 8889),
-            "bind_addr": proxy.get("bind_addr", "0.0.0.0"),
-        },
-        "routing": {"mode": routing.get("mode", "vpn-default")},
-    }
-
-
-def _toml_str(v):
-    # Escape backslashes and double-quotes for a basic TOML string.
-    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return {"vpn": {k: vpn.get(k, "") for k in ("host", "user", "group", "dns_server")} | {
+                "password_set": bool(vpn.get("password")), "auto_reconnect": vpn.get("auto_reconnect", False)},
+            "routing": {"mode": cfg.get("routing", {}).get("mode", "direct-default")},
+            "docker": {"api_port": cfg.get("docker", {}).get("api_port", 8889),
+                       "relay_port": cfg.get("docker", {}).get("relay_port", 1080)}}
 
 
 def serialize_config(cfg):
-    """Render the config dict back to config.toml's canonical layout. Comments
-    are not preserved (the file is machine-managed by the wizard + dashboard)."""
-    vpn = cfg.get("vpn", {})
-    wsl = cfg.get("wsl", {})
-    proxy = cfg.get("proxy", {})
-    routing = cfg.get("routing", {})
-    lines = []
-    lines.append("# wsl-vpn-router configuration. Managed by `vpn configure` + the dashboard.")
-    lines.append("# Plaintext secrets - this file lives under %LOCALAPPDATA% and is per-user.")
-    lines.append("")
-    lines.append("[vpn]")
-    lines.append(f"host     = {_toml_str(vpn.get('host', ''))}")
-    lines.append(f"user     = {_toml_str(vpn.get('user', ''))}")
-    lines.append(f"password = {_toml_str(vpn.get('password', ''))}")
-    if vpn.get("group", ""):
-        lines.append(f"group    = {_toml_str(vpn.get('group'))}")
-    else:
-        lines.append('# group  = "your-auth-group"')
-    lines.append("")
-    lines.append("[wsl]")
-    lines.append(f"distro        = {_toml_str(wsl.get('distro', 'Ubuntu'))}")
-    lines.append(f"sudo_password = {_toml_str(wsl.get('sudo_password', ''))}")
-    lines.append("")
-    lines.append("[proxy]")
-    lines.append(f"http_port = {int(proxy.get('http_port', 8888))}")
-    lines.append(f"pac_port  = {int(proxy.get('pac_port', 8889))}")
-    lines.append(f"bind_addr = {_toml_str(proxy.get('bind_addr', '0.0.0.0'))}")
-    lines.append("")
-    lines.append("[routing]")
-    lines.append(f"mode = {_toml_str(routing.get('mode', 'vpn-default'))}")
+    lines = ["# Docker VPN router configuration; contains your VPN password."]
+    for section, values in cfg.items():
+        if section in ("wsl", "proxy"):
+            continue
+        lines.extend(["", "[" + section + "]"])
+        for key, value in values.items():
+            if not key.replace("_", "").isalnum():
+                raise ValueError("Invalid configuration key")
+            lines.append(key + " = " + json.dumps(value, ensure_ascii=False))
     return "\n".join(lines) + "\n"
 
 
-def update_config_from_api(body):
-    """Merge dashboard-submitted fields into config.toml. Secret fields
-    (password, sudo_password) are only overwritten when a non-empty value is
-    supplied; otherwise the existing value is preserved. Returns the new
-    read_config_for_api() view. Raises ValueError on bad input."""
-    cfg = load_config()
-    cfg.setdefault("vpn", {})
-    cfg.setdefault("wsl", {})
-    cfg.setdefault("proxy", {})
-    cfg.setdefault("routing", {})
-
-    v = body.get("vpn", {})
-    if "host" in v:  cfg["vpn"]["host"] = str(v["host"]).strip()
-    if "user" in v:  cfg["vpn"]["user"] = str(v["user"]).strip()
-    if "group" in v: cfg["vpn"]["group"] = str(v["group"]).strip()
-    if v.get("password"):  # only overwrite when a fresh value is provided
-        cfg["vpn"]["password"] = str(v["password"])
-
-    w = body.get("wsl", {})
-    if "distro" in w: cfg["wsl"]["distro"] = str(w["distro"]).strip()
-    if w.get("sudo_password"):
-        cfg["wsl"]["sudo_password"] = str(w["sudo_password"])
-
-    p = body.get("proxy", {})
-    for k in ("http_port", "pac_port"):
-        if k in p:
+def update_config(body):
+    with LOCK:
+        cfg = load_config()
+        for section, allowed in {"vpn": ("host", "user", "password", "group", "dns_server", "auto_reconnect"),
+                                 "routing": ("mode",)}.items():
+            values = body.get(section, {})
+            if not isinstance(values, dict):
+                raise ValueError("Configuration sections must be objects")
+            for key in allowed:
+                if key in values and (key != "password" or values[key]):
+                    if key == "auto_reconnect":
+                        if not isinstance(values[key], bool):
+                            raise ValueError("auto_reconnect must be true or false")
+                    elif not isinstance(values[key], str):
+                        raise ValueError(key + " must be a string")
+                    cfg.setdefault(section, {})[key] = values[key]
+        if cfg.get("routing", {}).get("mode", "direct-default") not in ("vpn-default", "direct-default"):
+            raise ValueError("Invalid routing mode")
+        for key in ("host", "user", "password"):
+            if not isinstance(cfg.get("vpn", {}).get(key), str) or not cfg["vpn"][key].strip():
+                raise ValueError("vpn." + key + " is required")
+        if cfg["vpn"].get("dns_server"):
             try:
-                cfg["proxy"][k] = int(p[k])
-            except (TypeError, ValueError):
-                raise ValueError(f"{k} must be an integer")
-    if "bind_addr" in p:
-        cfg["proxy"]["bind_addr"] = str(p["bind_addr"]).strip()
-
-    r = body.get("routing", {})
-    if "mode" in r:
-        if r["mode"] not in ("vpn-default", "direct-default"):
-            raise ValueError("mode must be 'vpn-default' or 'direct-default'")
-        cfg["routing"]["mode"] = r["mode"]
-
-    if not cfg["vpn"].get("host"):
-        raise ValueError("vpn.host is required")
-    if not cfg["wsl"].get("distro"):
-        raise ValueError("wsl.distro is required")
-
-    tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(serialize_config(cfg))
-    os.replace(tmp, CONFIG_PATH)
-    return read_config_for_api()
+                ipaddress.ip_address(cfg["vpn"]["dns_server"])
+            except ValueError:
+                raise ValueError("vpn.dns_server must be a corporate DNS IP address") from None
+        temporary = CONFIG_PATH.with_suffix(".tmp")
+        temporary.write_text(serialize_config(cfg), encoding="utf-8")
+        temporary.replace(CONFIG_PATH)
+        return read_config_for_api()
 
 
-WINDOWS_HOSTS = "/mnt/c/Windows/System32/drivers/etc/hosts"
-
-
-def read_windows_hosts_hostnames():
-    """Parse the Windows hosts file (visible from WSL at /mnt/c/...) and return
-    the hostnames it pins, minus loopback/broadcast junk. These are typically
-    corporate hosts mapped to private IPs - exactly the set a user wants to
-    pin into vpn.list. Returns a de-duplicated, order-preserving list."""
-    out, seen = [], set()
+def stop_process(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
     try:
-        with open(WINDOWS_HOSTS, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return out
-    for raw in lines:
-        line = raw.strip().lstrip("﻿")  # tolerate BOM on first line
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        ip, names = parts[0], parts[1:]
-        # skip loopback / unspecified / link-local mappings
-        if ip.startswith(("127.", "0.0.0.0", "::1", "fe80", "ff")):
-            continue
-        for name in names:
-            n = name.strip()
-            if not n or n.startswith("#"):
-                break  # rest of line is a comment
-            key = n.lower()
-            if key not in seen:
-                seen.add(key)
-                out.append(n)
-    return out
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
-def read_list_lines(path):
+def restore_container_network():
+    if (RUNTIME / "original-route.json").exists():
+        env = dict(os.environ, reason="disconnect")
+        subprocess.run(["/app/vpnc-script.py"], env=env, check=False)
+
+
+def disconnect():
+    global TUNNEL, RELAY
+    CANCEL.set()
+    # Stop children before joining the worker, but never join while holding LOCK.
+    with LOCK:
+        stop_process(AUTH)
+        stop_process(RELAY)
+        stop_process(TUNNEL)
+        restore_container_network()
+    worker = WORKER
+    if worker and worker is not threading.current_thread():
+        worker.join(timeout=10)
+    with LOCK:
+        TUNNEL = RELAY = None
+        STATE.update(connection_state="disconnected", oc_pid=0, relay_pid=0, error="")
+
+
+def auth_command(vpn):
+    args = ["openconnect", "--authenticate", "--non-inter", "--no-proxy", "--passwd-on-stdin",
+            "--user=" + vpn["user"]]
+    if vpn.get("group"):
+        args.append("--authgroup=" + vpn["group"])
+    return args + ["--", vpn["host"]]
+
+
+def tunnel_command(vpn, session):
+    # This process never receives the password. Expired cookies cannot trigger fresh MFA.
+    args = ["openconnect", "--cookie-on-stdin", "--no-passwd", "--non-inter", "--no-proxy",
+            "--interface=tun0", "--script=exec /app/vpnc-script.py",
+            "--reconnect-timeout=" + ("300" if vpn.get("auto_reconnect", False) is True else "0")]
+    for key, flag in (("FINGERPRINT", "--servercert="), ("RESOLVE", "--resolve=")):
+        if session.get(key):
+            args.append(flag + session[key])
+    return args + ["--", session.get("CONNECT_URL") or session.get("HOST") or vpn["host"]]
+
+
+def parse_session(output):
+    session = {}
+    for line in output.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("COOKIE", "HOST", "CONNECT_URL", "RESOLVE", "FINGERPRINT"):
+            words = shlex.split(value)
+            if len(words) == 1:
+                session[key] = words[0]
+    if not session.get("COOKIE"):
+        raise ValueError("Authentication did not return a session cookie; reconnect manually")
+    return session
+
+
+def relay_config(vpn, network):
+    dns = vpn.get("dns_server") or next(iter(network.get("dns", [])), "")
+    if not dns:
+        raise ValueError("VPN did not provide DNS; set vpn.dns_server to your corporate DNS IP")
+    ipaddress.ip_address(dns)
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {"servers": [{"type": "udp", "tag": "corp", "server": dns,
+                              "bind_interface": "tun0"}], "final": "corp"},
+        "inbounds": [{"type": "shadowsocks", "listen": "0.0.0.0",
+                      "listen_port": load_config().get("docker", {}).get("relay_port", 1080),
+                      "method": "chacha20-ietf-poly1305",
+                      "password": (RUNTIME / "relay.key").read_text().strip()}],
+        "outbounds": [{"type": "direct", "tag": "vpn", "bind_interface": "tun0",
+                       "domain_resolver": "corp"}], "route": {"final": "vpn"}}
+
+
+def connect_worker():
+    global AUTH, TUNNEL, RELAY
     try:
-        with open(path) as f:
-            return [ln.rstrip("\n") for ln in f.readlines()]
-    except FileNotFoundError:
-        return []
-
-
-def write_list_lines(path, lines):
-    # Always end with a newline; collapse multiple trailing blanks.
-    body = "\n".join(ln.rstrip() for ln in lines).rstrip() + "\n"
-    with open(path, "w") as f:
-        f.write(body)
-
-
-def apply_list_edits(path, add=None, remove=None):
-    """Apply add/remove edits to a list file. Adds are appended if not present
-    (case-insensitive). Removes drop any matching lines (case-insensitive,
-    ignoring inline comments). Returns (added, removed, skipped) tuples."""
-    add = add or []
-    remove = remove or []
-    with _lists_write_lock:
-        lines = read_list_lines(path)
-        existing_norm = set()
-        for ln in lines:
-            stripped = ln.split("#", 1)[0].strip().lower()
-            if stripped:
-                existing_norm.add(stripped)
-
-        added, skipped = [], []
-        for entry in add:
-            e = entry.strip()
-            if not e:
-                continue
-            if e.lower() in existing_norm:
-                skipped.append(e)
+        vpn = load_config()["vpn"]
+        # Cookies stay in memory; never log authentication stdout or put secrets in argv.
+        with LOG_PATHS["oc"].open("a", encoding="utf-8") as logfile:
+            with LOCK:
+                if CANCEL.is_set():
+                    return
+                AUTH = subprocess.Popen(auth_command(vpn), stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=logfile, text=True,
+                                        start_new_session=True)
+                auth = AUTH
+            try:
+                output, _ = auth.communicate(vpn["password"] + "\n", timeout=90)
+            except subprocess.TimeoutExpired:
+                stop_process(auth)
+                raise ValueError("Authentication timed out; reconnect manually")
+            if CANCEL.is_set():
+                return
+            if auth.returncode:
+                raise ValueError("Authentication failed or was declined; reconnect manually")
+            session = parse_session(output)
+            with LOCK:
+                if CANCEL.is_set():
+                    return
+                AUTH = None
+                TUNNEL = subprocess.Popen(tunnel_command(vpn, session), stdin=subprocess.PIPE,
+                                          stdout=logfile, stderr=logfile, text=True, start_new_session=True,
+                                          env={**os.environ, "VPN_ALLOW_RECONNECT": "1" if vpn.get("auto_reconnect", False) is True else "0"})
+                TUNNEL.stdin.write(session.pop("COOKIE") + "\n")
+                TUNNEL.stdin.close()
+                STATE["oc_pid"] = TUNNEL.pid
+            for _ in range(60):
+                if CANCEL.wait(0.5):
+                    return
+                if TUNNEL.poll() is not None:
+                    raise ValueError("VPN session ended; reconnect manually")
+                if Path("/sys/class/net/tun0").exists() and (RUNTIME / "network.json").exists():
+                    break
             else:
-                lines.append(e)
-                existing_norm.add(e.lower())
-                added.append(e)
-
-        removed = []
-        if remove:
-            rm_set = {r.strip().lower() for r in remove if r.strip()}
-            kept = []
-            for ln in lines:
-                content = ln.split("#", 1)[0].strip().lower()
-                if content and content in rm_set:
-                    removed.append(ln.strip())
+                raise ValueError("VPN tunnel did not become ready; reconnect manually")
+            with LOCK:
+                if CANCEL.is_set():
+                    return
+                network = json.loads((RUNTIME / "network.json").read_text())
+                relay_path = RUNTIME / "relay.json"
+                relay_path.write_text(json.dumps(relay_config(vpn, network)), encoding="utf-8")
+                subprocess.run(["sing-box", "check", "-c", str(relay_path)], check=True,
+                               stdout=logfile, stderr=logfile)
+                with LOG_PATHS["proxy"].open("a") as relay_log:
+                    RELAY = subprocess.Popen(["sing-box", "run", "-c", str(relay_path)],
+                                             stdout=relay_log, stderr=relay_log, start_new_session=True)
+                port = load_config().get("docker", {}).get("relay_port", 1080)
+                for _ in range(50):
+                    if RELAY.poll() is not None:
+                        raise ValueError("VPN relay failed to start; inspect the relay log")
+                    try:
+                        with socket.create_connection(("127.0.0.1", port), timeout=.1):
+                            break
+                    except OSError:
+                        time.sleep(.1)
                 else:
-                    kept.append(ln)
-            lines = kept
-
-        write_list_lines(path, lines)
-        return added, removed, skipped
-
-
-def read_log_tail(path, n):
-    if not os.path.exists(path):
-        return ""
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            chunk = min(size, max(n * 250, 8192))
-            f.seek(max(0, size - chunk))
-            data = f.read().decode("utf-8", errors="replace")
-        lines = data.splitlines()
-        return "\n".join(lines[-n:]) + ("\n" if lines else "")
-    except Exception as e:
-        return f"<error reading {path}: {e}>\n"
+                    raise ValueError("VPN relay did not become ready")
+                STATE.update(connection_state="connected", relay_pid=RELAY.pid, error="")
+            while not CANCEL.wait(1):
+                if TUNNEL.poll() is not None or RELAY.poll() is not None:
+                    raise ValueError("VPN session ended; reconnect manually (automatic login is disabled)")
+    except Exception as error:
+        event(error)
+        with LOCK:
+            stop_process(RELAY)
+            stop_process(TUNNEL)
+            restore_container_network()
+            STATE.update(connection_state="disconnected", oc_pid=0, relay_pid=0, error=str(error))
+    finally:
+        with LOCK:
+            AUTH = None
 
 
-def get_tun0_ip():
-    try:
-        out = subprocess.check_output(
-            ["bash", "-c", "ip -4 -br addr show tun0 2>/dev/null | awk '{print $3}'"],
-            text=True,
-        ).strip()
-        return out
-    except Exception:
-        return ""
+def connect():
+    global WORKER
+    with LOCK:
+        if STATE["connection_state"] in ("connecting", "connected") or (WORKER and WORKER.is_alive()):
+            return
+        CANCEL.clear()
+        (RUNTIME / "network.json").unlink(missing_ok=True)
+        STATE.update(connection_state="connecting", error="")
+        WORKER = threading.Thread(target=connect_worker, daemon=True)
+        WORKER.start()
 
 
 def build_status():
-    VPN_RULES.reload_if_changed()
-    DIRECT_RULES.reload_if_changed()
-    vd, vc, vu = VPN_RULES.snapshot()
-    dd, dc, du = DIRECT_RULES.snapshot()
-    return {
-        "version": DAEMON_VERSION,
-        "mode": current_mode(),
-        "oc_pid": is_alive(OC_PID),
-        "tinyproxy_pid": tinyproxy_pid(),
-        "pac_pid": os.getpid(),
-        "tun0_ip": get_tun0_ip(),
-        "wsl_ip": PacHandler.proxy_host,
-        "proxy_port": PacHandler.proxy_port,
-        "vpn_list": {"domains": len(vd), "cidrs": len(vc), "urls": len(vu),
-                     "mtime": VPN_RULES.mtime, "last_reload": VPN_RULES.last_reload},
-        "direct_list": {"domains": len(dd), "cidrs": len(dc), "urls": len(du),
-                        "mtime": DIRECT_RULES.mtime, "last_reload": DIRECT_RULES.last_reload},
-    }
+    with LOCK:
+        status = dict(STATE)
+    network = {}
+    with contextlib.suppress(OSError, ValueError):
+        network = json.loads((RUNTIME / "network.json").read_text())
+    cfg = load_config()
+
+    router_status = {}
+    with contextlib.suppress(OSError, ValueError):
+        router_status = json.loads(Path("/router-status/status.json").read_text())
+    router_active = router_status.get("active", False) and time.time() - router_status.get("updated", 0) < 6
+    status.update(router_active=router_active, router_error=router_status.get("error", ""))
+    status.update(version=os.environ.get("VPN_VERSION", "dev"), mode=cfg.get("routing", {}).get("mode", "direct-default"),
+                  runtime="docker", router="windows-tun", tun0_ip=network.get("address", "") if status["oc_pid"] else "",
+                  proxy_host="127.0.0.1", proxy_port=cfg.get("docker", {}).get("relay_port", 1080),
+                  daemon_pid=os.getpid(), auto_reconnect=cfg.get("vpn", {}).get("auto_reconnect", False))
+    for which in ("vpn", "direct"):
+        values = entries(which)
+        status[which + "_list"] = {"domains": sum("/" not in e for e in values),
+                                  "cidrs": sum("/" in e and "://" not in e for e in values),
+                                  "urls": sum("://" in e for e in values)}
+    return status
 
 
-# ---------- HTTP server ----------
-_STATIC_TYPES = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "application/javascript; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".svg": "image/svg+xml",
-    ".png": "image/png",
-    ".ico": "image/x-icon",
-    ".json": "application/json",
-    ".woff2": "font/woff2",
-}
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
 
-
-class PacHandler(BaseHTTPRequestHandler):
-    proxy_host = "127.0.0.1"
-    proxy_port = 8888
-
-    def log_message(self, format, *args):  # noqa: A002 - matches base class
-        log("http " + (format % args))
-
-    # ---- response helpers ----
-    def _send(self, code, ctype, body, *, cache=False):
-        b = body.encode("utf-8") if isinstance(body, str) else body
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        if not cache:
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-        # CORS: dashboard might be opened via http://localhost too if a tray
-        # forwarder is added later; harmless for a LAN-bound daemon.
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Content-Length", str(len(b)))
+    def send(self, value, status=200, content_type="application/json"):
+        data = (json.dumps(value) if content_type == "application/json" else value).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; frame-ancestors 'none'")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(b)
+        self.wfile.write(data)
 
-    def _json(self, obj, code=200):
-        self._send(code, "application/json", json.dumps(obj, indent=2))
+    def authorized(self):
+        port = load_config().get("docker", {}).get("api_port", 8889)
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.headers.get("Host") not in allowed:
+            self.send({"error": "Invalid Host"}, 403)
+            return False
+        origin = self.headers.get("Origin")
+        if origin and origin not in {"http://" + host for host in allowed}:
+            self.send({"error": "Invalid Origin"}, 403)
+            return False
+        if self.path.startswith("/api/"):
+            expected = "Bearer " + (RUNTIME / "api.token").read_text().strip()
+            if not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected.encode()):
+                self.send({"error": "Unauthorized"}, 401)
+                return False
+        return True
 
-    def _err(self, code, msg):
-        self._json({"error": msg}, code=code)
-
-    def _read_json(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if not n:
-            return {}
-        try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
-        except Exception as e:
-            raise ValueError(f"invalid JSON: {e}")
-
-    # ---- static dashboard ----
-    def _serve_static(self, rel):
-        # Default index for "/" or "" → index.html.
-        if rel in ("", "/"):
-            rel = "index.html"
-        rel = rel.lstrip("/")
-        # No directory traversal.
-        full = os.path.normpath(os.path.join(STATIC_DIR, rel))
-        if not full.startswith(STATIC_DIR + os.sep) and full != STATIC_DIR:
-            return self._err(403, "forbidden")
-        if not os.path.isfile(full):
-            return self._err(404, "not found")
-        ext = os.path.splitext(full)[1].lower()
-        ctype = _STATIC_TYPES.get(ext, "application/octet-stream")
-        with open(full, "rb") as f:
-            data = f.read()
-        # Cache assets but never index.html (so dashboard updates land instantly).
-        cache = ext in (".css", ".js", ".svg", ".png", ".ico", ".woff2")
-        self._send(200, ctype, data, cache=cache)
-
-    # ---- routing ----
-    def do_OPTIONS(self):  # noqa: N802
-        self._send(204, "text/plain", "")
-
-    def do_GET(self):  # noqa: N802
-        path = self.path.split("?", 1)[0]
-        qs = {}
-        if "?" in self.path:
-            from urllib.parse import parse_qs
-            qs = parse_qs(self.path.split("?", 1)[1])
-
-        # PAC
-        if path in ("/proxy.pac", "/wpad.dat"):
-            VPN_RULES.reload_if_changed()
-            DIRECT_RULES.reload_if_changed()
-            pac = build_pac(self.proxy_host, self.proxy_port, current_mode())
-            return self._send(200, "application/x-ns-proxy-autoconfig", pac)
-
-        # API
-        if path in ("/api/status", "/status"):
-            return self._json(build_status())
-        if path == "/api/mode":
-            return self._json({"mode": current_mode()})
+    def do_GET(self):
+        if not self.authorized():
+            return
+        path = urlsplit(self.path).path
+        if path == "/api/status":
+            return self.send(build_status())
         if path == "/api/config":
-            return self._json(read_config_for_api())
-        if path == "/api/hosts-file":
-            names = read_windows_hosts_hostnames()
-            return self._json({"hostnames": names, "count": len(names)})
-        if path.startswith("/api/lists/"):
-            which = path.split("/")[-1]
-            if which not in ("vpn", "direct"):
-                return self._err(404, "unknown list")
-            target = VPN_LIST_PATH if which == "vpn" else DIRECT_PATH
-            # ?format=raw -> downloadable text file (full file incl. comments).
-            if qs.get("format", [""])[0] == "raw":
-                raw = "\n".join(read_list_lines(target)).rstrip() + "\n"
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Disposition",
-                                 f'attachment; filename="{which}.list"')
-                b = raw.encode("utf-8")
-                self.send_header("Content-Length", str(len(b)))
-                self.end_headers()
-                if self.command != "HEAD":
-                    self.wfile.write(b)
-                return
-            entries = [ln for ln in read_list_lines(target) if ln.strip()]
-            return self._json({"list": which, "entries": entries})
+            return self.send(read_config_for_api())
+        if path == "/api/mode":
+            return self.send({"mode": build_status()["mode"]})
+        if path.startswith("/api/lists/") and path.rsplit("/", 1)[1] in ("vpn", "direct"):
+            which = path.rsplit("/", 1)[1]
+            return self.send({"list": which, "entries": entries(which)})
         if path.startswith("/api/logs/"):
-            name = path.split("/")[-1]
-            if name not in LOG_PATHS:
-                return self._err(404, "unknown log")
-            tail = 200
-            try:
-                tail = max(1, min(2000, int(qs.get("tail", ["200"])[0])))
-            except ValueError:
-                pass
-            return self._send(200, "text/plain; charset=utf-8",
-                              read_log_tail(LOG_PATHS[name], tail))
+            name = path.rsplit("/", 1)[1]
+            if name in LOG_PATHS:
+                text = ""
+                if LOG_PATHS[name].exists():
+                    with LOG_PATHS[name].open("rb") as stream:
+                        stream.seek(0, 2)
+                        stream.seek(max(0, stream.tell() - 50000))
+                        text = stream.read().decode("utf-8", errors="replace")
+                return self.send(text, content_type="text/plain; charset=utf-8")
+        if path == "/":
+            html = (INSTALL_DIR / "static/index.html").read_text(encoding="utf-8")
+            return self.send(html, content_type="text/html; charset=utf-8")
+        if path in ("/app.js", "/style.css"):
+            mime = "text/javascript" if path.endswith("js") else "text/css"
+            return self.send((INSTALL_DIR / "static" / path[1:]).read_text(encoding="utf-8"), content_type=mime)
+        return self.send({"error": "Not found"}, 404)
 
-        # Dashboard / static
-        if path == "/" or path.startswith("/static/") or path in ("/favicon.ico",):
-            rel = "" if path in ("/", "") else path[len("/static/"):] if path.startswith("/static/") else path[1:]
-            return self._serve_static(rel)
-
-        # Backwards-compat aliases
-        if path == "/reload":
-            c1 = VPN_RULES.reload_if_changed()
-            c2 = DIRECT_RULES.reload_if_changed()
-            return self._send(200, "text/plain",
-                              "reloaded\n" if (c1 or c2) else "no change\n")
-
-        self._err(404, "not found")
-
-    def do_POST(self):  # noqa: N802
-        path = self.path.split("?", 1)[0]
+    def do_POST(self):
+        if not self.authorized():
+            return
         try:
-            if path == "/api/mode":
-                body = self._read_json()
-                new = body.get("mode", "")
-                set_config_mode(new)
-                VPN_RULES.reload_if_changed()
-                DIRECT_RULES.reload_if_changed()
-                log(f"api: mode -> {new}")
-                return self._json({"mode": current_mode()})
-
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= length <= 65536:
+                raise ValueError("Request is too large")
+            body = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("JSON object required")
+            path = urlsplit(self.path).path
+            if path == "/api/connect":
+                connect()
+                return self.send(build_status(), 202)
+            if path == "/api/disconnect":
+                disconnect()
+                return self.send(build_status())
             if path == "/api/config":
-                body = self._read_json()
-                try:
-                    updated = update_config_from_api(body)
-                except ValueError as e:
-                    return self._err(400, str(e))
-                # mode change propagates to PAC immediately; other fields
-                # (creds/ports/distro) need a daemon restart to take effect.
-                VPN_RULES.reload_if_changed()
-                DIRECT_RULES.reload_if_changed()
-                log("api: config updated")
-                return self._json({"config": updated,
-                                   "restart_required": True})
-
-            if path == "/api/lists/vpn" or path == "/api/lists/direct":
-                which = "vpn" if path.endswith("vpn") else "direct"
-                target = VPN_LIST_PATH if which == "vpn" else DIRECT_PATH
-                body = self._read_json()
-                # Import / replace: {"replace": "<full text>"} or {"replace": [lines]}
-                if "replace" in body:
-                    repl = body["replace"]
-                    if isinstance(repl, str):
-                        repl = repl.splitlines()
-                    write_list_lines(target, [str(x) for x in repl])
-                    rules = VPN_RULES if which == "vpn" else DIRECT_RULES
-                    rules.reload_if_changed()
-                    n = len([x for x in read_list_lines(target) if x.strip()])
-                    log(f"api: {which}.list replaced ({n} entries)")
-                    return self._json({"list": which, "replaced": True, "count": n})
-                added, removed, skipped = apply_list_edits(
-                    target, add=body.get("add"), remove=body.get("remove"))
-                # Touch reload so PAC reflects immediately.
-                rules = VPN_RULES if which == "vpn" else DIRECT_RULES
-                rules.reload_if_changed()
-                log(f"api: {which}.list edits +{len(added)} -{len(removed)}")
-                return self._json({"list": which, "added": added,
-                                   "removed": removed, "skipped": skipped})
-
-            if path in ("/api/reload", "/reload"):
-                c1 = VPN_RULES.reload_if_changed()
-                c2 = DIRECT_RULES.reload_if_changed()
-                return self._json({"reloaded": bool(c1 or c2)})
-
-            if path == "/api/restart-openconnect":
-                cfg = load_config()
-                sudo_pw = cfg.get("wsl", {}).get("sudo_password", "")
-                kill_pid_file(OC_PID, with_sudo=True, sudo_pw=sudo_pw)
-                # tear down stray openconnects too
-                subprocess.run(
-                    ["bash", "-c",
-                     f"echo {shlex.quote(sudo_pw)} | sudo -S pkill openconnect 2>/dev/null; true"],
-                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                start_openconnect(cfg)
-                return self._json({"oc_pid": is_alive(OC_PID), "tun0_ip": get_tun0_ip()})
-
-            return self._err(404, "not found")
-        except ValueError as e:
-            return self._err(400, str(e))
-        except Exception as e:
-            log(f"api error on {path}: {e}")
-            return self._err(500, str(e))
-
-    def do_DELETE(self):  # noqa: N802
-        # DELETE on a list is sugar for POST {remove:[...]} with the entry in
-        # the path: /api/lists/vpn/sourcecontrol.diyarme.com
-        path = self.path.split("?", 1)[0]
-        if path.startswith("/api/lists/"):
-            parts = path.split("/", 4)  # ['', 'api', 'lists', '<which>', '<entry>']
-            if len(parts) < 5:
-                return self._err(400, "missing entry")
-            which, entry = parts[3], parts[4]
-            if which not in ("vpn", "direct"):
-                return self._err(404, "unknown list")
-            target = VPN_LIST_PATH if which == "vpn" else DIRECT_PATH
-            from urllib.parse import unquote
-            entry = unquote(entry)
-            try:
-                added, removed, skipped = apply_list_edits(target, remove=[entry])
-                rules = VPN_RULES if which == "vpn" else DIRECT_RULES
-                rules.reload_if_changed()
-                return self._json({"removed": removed})
-            except Exception as e:
-                return self._err(500, str(e))
-        return self._err(404, "not found")
-
-
-def watcher_thread():
-    while True:
-        try:
-            VPN_RULES.reload_if_changed()
-            DIRECT_RULES.reload_if_changed()
-        except Exception as e:
-            log(f"watcher error: {e}")
-        time.sleep(1)
-
-
-# ---------- Main ----------
-def redirect_logs_to_pac_log():
-    """Redirect stdout/stderr (and OS-level fds 1/2) to PAC_LOG.
-
-    We launch the daemon via `Start-Process wsl.exe -e python3 vpnctl.py`
-    from PowerShell with no bash wrapper, because a `bash -c` wrapper around
-    this exits prematurely when wsl.exe is launched detached on Windows. That
-    leaves no shell to apply `>pac.log 2>&1`, so vpnctl.py has to redirect
-    its own output instead.
-    """
-    fd = os.open(PAC_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    os.dup2(fd, 1)
-    os.dup2(fd, 2)
-    os.close(fd)
-    sys.stdout = os.fdopen(1, "w", buffering=1)
-    sys.stderr = os.fdopen(2, "w", buffering=1)
+                return self.send(update_config(body))
+            if path == "/api/mode":
+                update_config({"routing": {"mode": body.get("mode")}})
+                return self.send({"mode": build_status()["mode"]})
+            if path == "/api/reload":
+                return self.send({"ok": True})
+            if path.startswith("/api/lists/") and path.rsplit("/", 1)[1] in ("vpn", "direct"):
+                which = path.rsplit("/", 1)[1]
+                for field in ("add", "remove"):
+                    values = body.get(field, [])
+                    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                        raise ValueError(field + " must be an array of routing entries")
+                with LOCK:
+                    current = entries(which)
+                    added, skipped = [], []
+                    for entry in body.get("add", []):
+                        entry = normalize_entry(entry)
+                        (skipped if entry in current else added).append(entry)
+                        if entry not in current:
+                            current.append(entry)
+                    to_remove = {normalize_entry(entry) for entry in body.get("remove", [])}
+                    removed = [entry for entry in current if normalize_entry(entry) in to_remove]
+                    current = [entry for entry in current if normalize_entry(entry) not in to_remove]
+                    target = DATA_DIR / (which + ".list")
+                    temporary = target.with_suffix(".tmp")
+                    temporary.write_text("\n".join(current) + "\n", encoding="utf-8")
+                    temporary.replace(target)
+                return self.send({"list": which, "added": added, "skipped": skipped, "removed": removed})
+            return self.send({"error": "Not found"}, 404)
+        except (ValueError, TypeError, KeyError) as error:
+            return self.send({"error": str(error)}, 400)
 
 
 def main():
-    redirect_logs_to_pac_log()
-    cfg = load_config()
-    proxy_port = int(cfg["proxy"]["http_port"])
-    pac_port = int(cfg["proxy"]["pac_port"])
-    bind = cfg["proxy"]["bind_addr"]
-    # Embed the WSL eth0 IP in PAC so Windows browsers reach the proxy
-    # directly. (Re-running `vpn up` after a WSL restart refreshes this.)
-    PacHandler.proxy_host = get_eth0_ip()
-    PacHandler.proxy_port = proxy_port
-    log(f"PAC will return PROXY {PacHandler.proxy_host}:{proxy_port}")
-    # write our own pid
-    with open(PAC_PID, "w") as f:
-        f.write(str(os.getpid()))
-
+    # Never restore a session or authenticate on container startup/restart.
+    port = load_config().get("docker", {}).get("api_port", 8889)
     def shutdown(*_):
-        log("shutting down")
-        sudo_pw = cfg.get("wsl", {}).get("sudo_password", "")
-        tp = tinyproxy_pid()
-        if tp:
-            subprocess.run(
-                ["sudo", "-S", "kill", str(tp)],
-                input=sudo_pw + "\n", text=True, check=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        kill_pid_file(OC_PID, with_sudo=True, sudo_pw=sudo_pw)
-        for f in (PAC_PID, TP_PID_MIRROR):
-            try:
-                os.remove(f)
-            except FileNotFoundError:
-                pass
-        os._exit(0)
-
+        disconnect()
+        raise SystemExit(0)
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-
-    start_openconnect(cfg)
-    start_tinyproxy(cfg)
-    VPN_RULES.reload_if_changed()
-    DIRECT_RULES.reload_if_changed()
-
-    threading.Thread(target=watcher_thread, daemon=True).start()
-    threading.Thread(target=log_mirror_thread, daemon=True).start()
-    log(f"PAC server on {bind}:{pac_port}")
-    srv = ThreadingHTTPServer((bind, pac_port), PacHandler)
-    srv.daemon_threads = True
-    srv.serve_forever()
+    event("Docker daemon ready; waiting for an explicit Connect action")
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

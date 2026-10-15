@@ -1,172 +1,37 @@
-# Troubleshooting
+# Troubleshooting and migration
 
-Symptoms → causes → fixes. If your problem isn't here, check the logs:
+## Docker unavailable
 
-```powershell
-vpn logs oc -f         # openconnect (handshake / tunnel)
-vpn logs pac -f        # vpnctl.py (daemon, REST API)
-vpn logs proxy -f      # tinyproxy
-```
+Start Docker Desktop with Linux containers. Up requires a local Windows named-pipe Docker context and rejects remote engines. The tool leaves Docker's backend alone; the VPN hook changes only its container's network namespace.
 
-All under `%LOCALAPPDATA%\wsl-vpn-router\runtime\`.
+## Migrating from the old release
 
-## Install fails
+Stop the old release using its `vpn down` before upgrading. The new controller runs no WSL cleanup or distro-removal commands. `vpn repair-proxy` recognizes legacy endpoints using the old configuration/PAC log, backs up removed values in `legacy-proxy-backup.json` and preserves unrelated proxies.
 
-### "msiexec returned 1603" / "unknown error"
+Running apps can retain the old environment or their own manual proxy. Restart those apps once or clear their explicit proxy. Windows cannot rewrite every app's private in-memory environment. The new router does not add these settings again.
 
-Generic MSI failure. Re-run with verbose logging to see what:
+## Timeout or declined MFA
 
-```powershell
-$msi = "$env:TEMP\wsl-vpn-router-install\wsl-vpn-router-*.msi" | Resolve-Path
-msiexec /i $msi /l*v "$env:TEMP\wvr-install.log"
-notepad $env:TEMP\wvr-install.log
-```
+The VPN remains disconnected until you choose Up/Connect. `auto_reconnect = true` permits existing-cookie transport recovery only. Fresh password authentication always requires an explicit action. Read `vpn logs oc` for server errors.
 
-Most common: custom action `CaWslProvision` failed because the user account doesn't have WSL feature install rights. Run from an elevated PowerShell explicitly.
+## VPN connected but routing fails
 
-### "wsl --install failed" during wslprovision
+Check `vpn status` for native routing health as well as the tunnel. Up restores an inactive router using an existing connected VPN session. Check domain/IP rules, precedence, corporate DNS and hosts-file mappings. Both HTTP Git and SSH Git use the adapter; an explicit Git/application proxy can still interfere.
 
-Microsoft Store throttling. `wslprovision.ps1` uses `--web-download` to bypass the Store, but the Store is still consulted for kernel updates. Retry after a few minutes, or install Ubuntu manually:
+Use IP/CIDR rules for applications whose encrypted DNS and hidden hostnames prevent domain identification. HTTPS paths are unavailable to packet routing. Existing sockets may need to reconnect. Other VPN software, raw sockets, interface binding and firewall policy can affect coverage.
 
-```powershell
-wsl --install -d Ubuntu --web-download
-```
+## Internet breaks as the adapter starts
 
-Then re-run the wizard:
+Check IP forwarding on the outbound adapter. A live test reproduced self-captured router sockets when Ethernet forwarding was enabled, even in direct-default mode and with explicit interface binding. `routing.manage_forwarding = true` enables scoped, recoverable management of that setting; otherwise Up refuses the conflicting configuration before MFA. Do not globally disable forwarding on unrelated adapters. If startup fails, `vpn down` stops interception, and the independent recovery process restores recorded forwarding settings.
 
-```powershell
-vpn configure
-```
+## Config broken or Docker stopped
 
-## `vpn up` succeeds but tunnel never comes up
+`vpn down` works without valid configuration and removes interception before Docker cleanup. Complete service removal is `vpn router-uninstall` from an administrator terminal. OS DNS caches are flushed at adapter start/stop; apps holding their own synthetic DNS answers may need to re-resolve.
 
-### "Login failed" in oc.log
+## Diagnostics and release validation
 
-Your VPN rejected the username/password. Check, in order:
+Use `vpn logs oc`, `vpn logs proxy`, `vpn logs pac` and `vpn status`. Native logs are in `%ProgramData%\VPNRouter\router.log` and require administrator access.
 
-1. **Username format.** Some servers want bare `alice`, some want `alice@example.com`. Try both — `vpn configure` to update.
-2. **Password actually correct.** Open the official Cisco AnyConnect client and confirm you can log in with the same value.
-3. **Account locked from retries.** If you've banged on it 5+ times, wait 15-30 minutes for the lockout to clear.
-4. **Auth group.** Some servers require a `[vpn] group = "…"` value matching a connection profile name. The openconnect log shows it when the server prompts: `GROUP: [profile-A|profile-B]`.
+Before release, verify Docker startup/port forwarding, UAC/service ACLs, adapter create/stop/reload, real TCP/UDP/DNS/private hosts, MFA approve/decline/timeout, VPN expiry, Wi-Fi changes, sleep/resume and coexistence with other installed VPNs. Automated tests and localhost relay checks do not replace these live integration checks.
 
-### Duo push never arrives
-
-If the log shows `Login failed.` immediately after the POST, primary auth failed → Duo never fires. Fix primary auth first (above).
-
-If the log shows the POST succeeding and then nothing for ~30 seconds: that IS the push waiting. Check your phone — approve. If the push never arrives:
-
-- Confirm Duo is set up for push (not just passcode) on your account.
-- Confirm your phone has internet.
-- Try the official AnyConnect client — if push works there but not here, file an issue with the redacted `oc.log`.
-
-### `getaddrinfo failed for host`
-
-DNS failure inside WSL. Test:
-
-```powershell
-wsl -d Ubuntu -- nslookup vpn.example.com 8.8.8.8
-```
-
-If that returns NXDOMAIN, fix `[vpn] host` in config.toml. If it returns an IP, but `oc.log` still says getaddrinfo failed, your WSL distro's `/etc/resolv.conf` is broken — check with
-`wsl -d Ubuntu -- cat /etc/resolv.conf`.
-
-## Tunnel up, but pages won't load
-
-### TLS handshake stalls forever for a `vpn.list` host
-
-MSS / MTU mismatch. The daemon should install an iptables clamp; verify:
-
-```powershell
-wsl -d Ubuntu -- sudo iptables -t mangle -L OUTPUT -v -n | grep tun0
-```
-
-If empty, `vpn restart` to re-install. If still failing, your network has a weirder PMTU situation — open an issue.
-
-### `vpn.list` host returns HTTP 000 from `curl -x`
-
-`getent hosts <hostname>` inside WSL returns nothing. Your Windows hosts file maps the hostname, but WSL doesn't know:
-
-```powershell
-vpn sync-hosts
-```
-
-(`vpn up` already does this; sync-hosts is the manual button if you edited Windows hosts mid-session.)
-
-### Chrome still hits your home network
-
-WinINet PAC cache. `vpn add` / `vpn remove` flush it automatically, but mode changes and other edits sometimes don't. Order to try:
-
-1. **Fully quit Chrome.** Task Manager → end every `chrome.exe`, including background processes.
-2. Open Chrome → `chrome://net-internals/#proxy` → "Re-apply settings".
-3. Open the target site in **incognito** or a different browser to confirm whether the issue is Chrome-specific.
-
-### git / IDE still hits home network after `vpn up`
-
-Env vars are read at process startup. Restart your shell, IDE, and any long-running services.
-
-For JetBrains IDEs: **Settings → Appearance & Behavior → System Settings → HTTP Proxy** — set to "Auto-detect proxy settings" (which reads PAC) **or** "Manual proxy" pointing at the same URL as
-`HTTP_PROXY`.
-
-## After Windows reboot
-
-The WSL VM gets a new internal IP. The PAC URL and env vars from the previous boot point at the old IP and are stale:
-
-```powershell
-vpn up        # re-runs everything, picks up new IP
-```
-
-The tray detects "daemon unreachable" automatically after a reboot and goes grey; click **Up**.
-
-## Auto-up at Windows login
-
-Not built in. If you want it:
-
-1. **Task Scheduler** approach — create a "At log on" trigger that runs `C:\Program Files\wsl-vpn-router\vpn.exe up`. Caveat: Duo push fires at 9am whether or not you're looking.
-2. **Tray + click-once** — the default. Tray auto-starts (after `vpn autostart enable`), shows grey dot, you click **Up** to bring the tunnel up.
-
-## Tray clicks do nothing
-
-Either `vpn.exe` has a bug or `cmd.exe` isn't on the PATH the tray inherited. Make sure the tray was launched via `vpn-tray.exe` from Program Files (or via the autostart Run key), not via some custom
-launcher with a clobbered PATH.
-
-To verify the tray's PATH:
-
-```powershell
-Get-Process vpn-tray | ForEach-Object { (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").Path }
-```
-
-## Daemon won't start ("Could not determine WSL IP — daemon never came up")
-
-The distro isn't running. Check:
-
-```powershell
-wsl -l -v
-```
-
-If yours shows **Stopped**, kick it:
-
-```powershell
-wsl -d Ubuntu -e true
-vpn up
-```
-
-Persistent stuck VM:
-
-```powershell
-wsl --shutdown
-vpn up
-```
-
-(Don't use `--shutdown` casually — it kills every running WSL distro on the machine.)
-
-## tinyproxy: "Could not create the pool of children"
-
-Hand-edited `runtime/tinyproxy.conf`. Restore by `vpn restart` (the daemon regenerates it from scratch on every start).
-
-## "I changed config.toml and it's not picking up"
-
-`config.toml` is re-read per PAC request for **mode only** (cheap, hot). Other keys (credentials, ports, distro) load at daemon startup. After editing creds:
-
-```powershell
-vpn restart
-```
+The 2026-10-15 Windows session verified approved MFA, public HTTPS and ordinary Git, corporate HTTPS, UDP corporate DNS through the encrypted relay, live URL-rule reload without replacing the OpenConnect process, manual disconnect with direct traffic preserved and VPN traffic blocked, and forwarding/adapter restoration after graceful stop and forced termination. Declined/timed-out authentication and disabled transport retries have automated coverage. Sleep/resume, adapter switching and long session expiry remain untested live.

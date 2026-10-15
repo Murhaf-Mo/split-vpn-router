@@ -1,17 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  WiX v6 source for the wsl-vpn-router MSI.
+  WiX v6 source for the Split VPN Router MSI.
+  Historical installation/data/registry and MSI asset names remain stable for upgrades.
 
   Builds with:
-    wix build installer\wsl-vpn-router.wxs `
+    wix build installer\split-vpn-router.wxs `
       -arch x64 `
       -d Version=1.2.3 `
-      -d StagingDir=E:\work-repositories\wsl-vpn-router `
+      -d StagingDir=D:\play-repositories\split-vpn-router `
       -o wsl-vpn-router-1.2.3.msi
 
   - Version is supplied via -d Version=... from CI; defaults to 0.0.0 here.
   - StagingDir points at a directory holding the EXACT files we ship:
-      vpn.exe, vpn-tray.exe, vpnctl.py, setup-wsl.sh, vpn.list, direct.list,
+      vpn.exe, vpn-tray.exe, vpnctl.py, Dockerfile, .dockerignore, vpnc-script.py, vpn.list, direct.list,
       config.toml.example, uninstall.ps1, static\app.js, static\index.html,
       static\style.css.
     The release pipeline assembles this dir before invoking wix.
@@ -36,7 +37,7 @@
   <?endif?>
 
   <Package
-      Name="wsl-vpn-router"
+      Name="Split VPN Router"
       Manufacturer="Murhaf-Mo"
       Version="$(var.Version)"
       UpgradeCode="$(var.UpgradeCode)"
@@ -45,7 +46,7 @@
       Compressed="yes">
 
     <SummaryInformation
-        Description="WSL-backed PAC + OpenConnect routing for Windows"
+        Description="Docker VPN runtime with a Windows virtual network adapter"
         Manufacturer="Murhaf-Mo"/>
 
     <!-- In-place upgrades from any older version; explicit error on downgrade. -->
@@ -59,8 +60,8 @@
     <Icon Id="AppIcon.ico" SourceFile="$(var.StagingDir)\wsl-vpn-router.ico"/>
 
     <!-- Add/Remove Programs metadata. -->
-    <Property Id="ARPHELPLINK" Value="https://github.com/Murhaf-Mo/wsl-vpn-router"/>
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Murhaf-Mo/wsl-vpn-router"/>
+    <Property Id="ARPHELPLINK" Value="https://github.com/Murhaf-Mo/split-vpn-router"/>
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Murhaf-Mo/split-vpn-router"/>
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico"/>
     <Property Id="ARPNOMODIFY" Value="1"/>
     <Property Id="ARPNOREPAIR" Value="1"/>
@@ -76,26 +77,24 @@
 
     <!-- Start Menu folder. Shortcut launches the tray; user can pin to taskbar from there. -->
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="AppMenuDir" Name="wsl-vpn-router"/>
+      <Directory Id="AppMenuDir" Name="Split VPN Router"/>
     </StandardDirectory>
 
     <!-- Desktop shortcut directory (just a reference to the standard Desktop folder). -->
     <StandardDirectory Id="DesktopFolder"/>
 
-    <Feature Id="Main" Title="wsl-vpn-router" Level="1">
+    <Feature Id="Main" Title="Split VPN Router" Level="1">
 
       <!-- ===== Binaries (top-level INSTALLDIR) ===== -->
       <Component Id="cmpVpnExe" Guid="A2B1C3D4-0001-0001-0001-000000000001" Directory="INSTALLDIR">
         <File Id="filVpnExe" Source="$(var.StagingDir)\vpn.exe" KeyPath="yes"/>
+        <ServiceControl Id="ControlRouter" Name="VPNRouter" Stop="both" Remove="uninstall" Wait="yes"/>
       </Component>
       <Component Id="cmpVpnTrayExe" Guid="A2B1C3D4-0001-0001-0001-000000000002" Directory="INSTALLDIR">
         <File Id="filVpnTrayExe" Source="$(var.StagingDir)\vpn-tray.exe" KeyPath="yes"/>
       </Component>
       <Component Id="cmpVpnctlPy" Guid="A2B1C3D4-0001-0001-0001-000000000003" Directory="INSTALLDIR">
         <File Id="filVpnctlPy" Source="$(var.StagingDir)\vpnctl.py" KeyPath="yes"/>
-      </Component>
-      <Component Id="cmpSetupWslSh" Guid="A2B1C3D4-0001-0001-0001-000000000004" Directory="INSTALLDIR">
-        <File Id="filSetupWslSh" Source="$(var.StagingDir)\setup-wsl.sh" KeyPath="yes"/>
       </Component>
       <Component Id="cmpVpnList" Guid="A2B1C3D4-0001-0001-0001-000000000005" Directory="INSTALLDIR">
         <File Id="filVpnList" Source="$(var.StagingDir)\vpn.list" KeyPath="yes"/>
@@ -109,10 +108,6 @@
       <Component Id="cmpUninstallPs1" Guid="A2B1C3D4-0001-0001-0001-000000000008" Directory="INSTALLDIR">
         <File Id="filUninstallPs1" Source="$(var.StagingDir)\uninstall.ps1" KeyPath="yes"/>
       </Component>
-      <Component Id="cmpWslProvision" Guid="A2B1C3D4-0001-0001-0001-000000000009" Directory="INSTALLDIR">
-        <File Id="filWslProvision" Source="$(var.StagingDir)\wslprovision.ps1" KeyPath="yes"/>
-      </Component>
-
       <!-- The app icon file itself - shipped so shortcut Icon references resolve. -->
       <Component Id="cmpAppIcon" Guid="A2B1C3D4-0001-0001-0001-00000000000A" Directory="INSTALLDIR">
         <File Id="filAppIcon" Source="$(var.StagingDir)\wsl-vpn-router.ico" KeyPath="yes"/>
@@ -124,8 +119,8 @@
            sibling files (static/, vpnctl.py). -->
       <Component Id="cmpStartMenuShortcut" Guid="A2B1C3D4-0004-0004-0004-000000000001" Directory="AppMenuDir">
         <Shortcut Id="scStartMenuTray"
-                  Name="wsl-vpn-router"
-                  Description="System tray for the WSL-backed VPN router"
+                  Name="Split VPN Router"
+                  Description="System tray for the Docker VPN router"
                   Target="[INSTALLDIR]vpn-tray.exe"
                   WorkingDirectory="INSTALLDIR"
                   Icon="AppIcon.ico"
@@ -146,8 +141,8 @@
       <!-- ===== Desktop shortcut ===== -->
       <Component Id="cmpDesktopShortcut" Guid="A2B1C3D4-0004-0004-0004-000000000002" Directory="DesktopFolder">
         <Shortcut Id="scDesktopTray"
-                  Name="wsl-vpn-router"
-                  Description="System tray for the WSL-backed VPN router"
+                  Name="Split VPN Router"
+                  Description="System tray for the Docker VPN router"
                   Target="[INSTALLDIR]vpn-tray.exe"
                   WorkingDirectory="INSTALLDIR"
                   Icon="AppIcon.ico"
@@ -181,29 +176,30 @@
         </RegistryKey>
       </Component>
 
+      <Component Id="cmpRuntime20" Guid="A2B1C3D4-0005-0005-0005-000000000020" Directory="INSTALLDIR">
+        <File Id="filRuntime20" Source="$(var.StagingDir)\Dockerfile" KeyPath="yes"/>
+      </Component>
+      <Component Id="cmpRuntime21" Guid="A2B1C3D4-0005-0005-0005-000000000021" Directory="INSTALLDIR">
+        <File Id="filRuntime21" Source="$(var.StagingDir)\.dockerignore" KeyPath="yes"/>
+      </Component>
+      <Component Id="cmpRuntime22" Guid="A2B1C3D4-0005-0005-0005-000000000022" Directory="INSTALLDIR">
+        <File Id="filRuntime22" Source="$(var.StagingDir)\vpnc-script.py" KeyPath="yes"/>
+      </Component>
+      <Component Id="cmpRuntime23" Guid="A2B1C3D4-0005-0005-0005-000000000023" Directory="INSTALLDIR">
+        <File Id="filRuntime23" Source="$(var.StagingDir)\prepare-runtime.ps1" KeyPath="yes"/>
+      </Component>
+      <Component Id="cmpRuntime24" Guid="A2B1C3D4-0005-0005-0005-000000000024" Directory="INSTALLDIR">
+        <File Id="filRuntime24" Source="$(var.StagingDir)\sing-box.exe" KeyPath="yes"/>
+      </Component>
+      <Component Id="cmpRuntime25" Guid="A2B1C3D4-0005-0005-0005-000000000025" Directory="INSTALLDIR">
+        <File Id="filRuntime25" Source="$(var.StagingDir)\libcronet.dll" KeyPath="yes"/>
+      </Component>
+      <Component Id="cmpRuntime26" Guid="A2B1C3D4-0005-0005-0005-000000000026" Directory="INSTALLDIR">
+        <File Id="filRuntime26" Source="$(var.StagingDir)\sing-box-LICENSE.txt" KeyPath="yes"/>
+      </Component>
     </Feature>
 
-    <!--
-      No custom actions here on purpose.
-
-      Earlier versions ran wslprovision.cmd and `vpn.exe configure` from MSI
-      custom actions (WixQuietExec). That silenced their stdout/stderr and
-      made the install dialog appear frozen at 75% for the 5+ minutes that
-      wsl-install / apt-install can take on a fresh machine — and the MSI
-      Cancel button couldn't interrupt the external process either.
-
-      Those steps now live in install.ps1 (the irm one-liner wrapper). It
-      self-elevates once, runs `msiexec /i` for the fast file-copy phase,
-      then invokes wslprovision.cmd and `vpn.exe configure` directly in the
-      same elevated PowerShell console — all output is visible in real time.
-
-      Users who run the MSI standalone (without install.ps1) get just the
-      file copy. They are expected to then run, as admin:
-          "C:\Program Files\wsl-vpn-router\wslprovision.cmd"
-          "C:\Program Files\wsl-vpn-router\vpn.exe" configure
-      (Or just re-run the irm one-liner — it detects an existing install
-      and upgrades / completes provisioning idempotently.)
-    -->
-
+    <!-- The service is installed for the initiating user by vpn up, after UAC.
+         MSI stops/removes it during uninstall/upgrade. It never logs in to the VPN. -->
   </Package>
 </Wix>

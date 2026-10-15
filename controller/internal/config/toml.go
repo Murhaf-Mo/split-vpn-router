@@ -1,116 +1,112 @@
-// Package config reads and writes the project's tiny config.toml.
-// It's a deliberately minimal TOML implementation that matches the schema
-// the Python daemon already uses — no third-party TOML dep needed.
+// Package config reads TOML with proper quoting, comments and type validation.
 package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
-	"regexp"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 )
 
 type Config struct {
-	VPNHost      string
-	VPNUser      string
-	VPNPassword  string
-	VPNGroup     string
-	WSLDistro    string
-	SudoPassword string
-	HTTPPort     int
-	PACPort      int
-	BindAddr     string
-	Mode         string
-	Path         string // where it was read from
+	VPNHost, VPNUser, VPNPassword, VPNGroup, DNS, DirectDNS, Mode, Image, Path string
+	AutoReconnect, ManageForwarding                                            bool
+	APIport, RelayPort                                                         int
 }
 
-var (
-	reSection = regexp.MustCompile(`^\[([^\]]+)\]$`)
-	reKV      = regexp.MustCompile(`^([^=]+)=\s*(.*)$`)
-)
+type document struct {
+	VPN struct {
+		Host          string `toml:"host"`
+		User          string `toml:"user"`
+		Password      string `toml:"password"`
+		Group         string `toml:"group"`
+		DNS           string `toml:"dns_server"`
+		AutoReconnect bool   `toml:"auto_reconnect"`
+	} `toml:"vpn"`
+	Docker struct {
+		Image     string `toml:"image"`
+		APIport   int    `toml:"api_port"`
+		RelayPort int    `toml:"relay_port"`
+	} `toml:"docker"`
+	Routing struct {
+		Mode             string `toml:"mode"`
+		DirectDNS        string `toml:"direct_dns"`
+		ManageForwarding bool   `toml:"manage_forwarding"`
+	} `toml:"routing"`
+}
 
-// Load parses config.toml at path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	c := &Config{Path: path, Mode: "vpn-default", BindAddr: "0.0.0.0"}
-	section := ""
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := stripComment(raw)
-		if line == "" {
-			continue
-		}
-		if m := reSection.FindStringSubmatch(line); m != nil {
-			section = strings.TrimSpace(m[1])
-			continue
-		}
-		if m := reKV.FindStringSubmatch(line); m != nil {
-			k := strings.TrimSpace(m[1])
-			v := strings.Trim(strings.TrimSpace(m[2]), `"`)
-			switch section + "." + k {
-			case "vpn.host":
-				c.VPNHost = v
-			case "vpn.user":
-				c.VPNUser = v
-			case "vpn.password":
-				c.VPNPassword = v
-			case "vpn.group":
-				c.VPNGroup = v
-			case "wsl.distro":
-				c.WSLDistro = v
-			case "wsl.sudo_password":
-				c.SudoPassword = v
-			case "proxy.http_port":
-				fmt.Sscanf(v, "%d", &c.HTTPPort)
-			case "proxy.pac_port":
-				fmt.Sscanf(v, "%d", &c.PACPort)
-			case "proxy.bind_addr":
-				c.BindAddr = v
-			case "routing.mode":
-				c.Mode = v
-			}
-		}
+	var d document
+	d.Docker.Image = "split-vpn-router:local"
+	d.Docker.APIport = 8889
+	d.Docker.RelayPort = 1080
+	d.Routing.Mode = "direct-default"
+	d.Routing.DirectDNS = "1.1.1.1"
+	if _, err = toml.Decode(strings.TrimPrefix(string(data), "\ufeff"), &d); err != nil {
+		return nil, err
 	}
-	if c.HTTPPort == 0 {
-		c.HTTPPort = 8888
+	c := &Config{Path: path, VPNHost: d.VPN.Host, VPNUser: d.VPN.User, VPNPassword: d.VPN.Password, VPNGroup: d.VPN.Group,
+		DNS: d.VPN.DNS, AutoReconnect: d.VPN.AutoReconnect, Image: d.Docker.Image, APIport: d.Docker.APIport, RelayPort: d.Docker.RelayPort,
+		Mode: d.Routing.Mode, DirectDNS: d.Routing.DirectDNS, ManageForwarding: d.Routing.ManageForwarding}
+	if c.Mode != "vpn-default" && c.Mode != "direct-default" {
+		return nil, fmt.Errorf("invalid routing.mode")
 	}
-	if c.PACPort == 0 {
-		c.PACPort = 8889
+	if c.APIport < 1024 || c.APIport > 65535 || c.RelayPort < 1024 || c.RelayPort > 65535 || c.APIport == c.RelayPort {
+		return nil, fmt.Errorf("Docker ports must be distinct and between 1024 and 65535")
+	}
+	if _, err := netip.ParseAddr(c.DirectDNS); err != nil {
+		return nil, fmt.Errorf("routing.direct_dns must be an IP address")
+	}
+	if c.DNS != "" {
+		if _, err := netip.ParseAddr(c.DNS); err != nil {
+			return nil, fmt.Errorf("vpn.dns_server must be an IP address")
+		}
 	}
 	return c, nil
 }
 
-// SetMode rewrites routing.mode in place. Used by the CLI for offline edits
-// (e.g. before the daemon is running). When the daemon is up, prefer POST
-// /api/mode so PAC reloads automatically.
-func SetMode(path, newMode string) error {
-	if newMode != "vpn-default" && newMode != "direct-default" {
-		return fmt.Errorf(`mode must be "vpn-default" or "direct-default"`)
+func (c *Config) Serialize() string {
+	var d document
+	d.VPN.Host = c.VPNHost
+	d.VPN.User = c.VPNUser
+	d.VPN.Password = c.VPNPassword
+	d.VPN.Group = c.VPNGroup
+	d.VPN.DNS = c.DNS
+	d.VPN.AutoReconnect = c.AutoReconnect
+	d.Docker.Image = c.Image
+	d.Docker.APIport = c.APIport
+	d.Docker.RelayPort = c.RelayPort
+	d.Routing.Mode = c.Mode
+	d.Routing.DirectDNS = c.DirectDNS
+	d.Routing.ManageForwarding = c.ManageForwarding
+	var out strings.Builder
+	out.WriteString("# Docker VPN router; contains plaintext credentials.\n")
+	_ = toml.NewEncoder(&out).Encode(d)
+	return out.String()
+}
+
+func Save(path string, c *Config) error {
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, []byte(c.Serialize()), 0600); err != nil {
+		return err
 	}
-	data, err := os.ReadFile(path)
+	return os.Rename(temporary, path)
+}
+
+func SetMode(path, mode string) error {
+	if mode != "vpn-default" && mode != "direct-default" {
+		return fmt.Errorf("invalid routing mode")
+	}
+	c, err := Load(path)
 	if err != nil {
 		return err
 	}
-	text := string(data)
-	rMode := regexp.MustCompile(`(?m)^\s*mode\s*=.*$`)
-	rSection := regexp.MustCompile(`(?m)^\s*\[routing\]\s*$`)
-	hasModeInRouting := regexp.MustCompile(`(?ms)^\s*\[routing\][^\[]*?^\s*mode\s*=`).MatchString(text)
-	switch {
-	case hasModeInRouting:
-		text = rMode.ReplaceAllString(text, fmt.Sprintf(`mode = "%s"`, newMode))
-	case rSection.MatchString(text):
-		text = rSection.ReplaceAllString(text, fmt.Sprintf("[routing]\nmode = \"%s\"", newMode))
-	default:
-		text = strings.TrimRight(text, "\n") + fmt.Sprintf("\n\n[routing]\nmode = \"%s\"\n", newMode)
-	}
-	return os.WriteFile(path, []byte(text), 0o644)
-}
-
-func stripComment(line string) string {
-	if i := strings.Index(line, "#"); i >= 0 {
-		line = line[:i]
-	}
-	return strings.TrimSpace(line)
+	c.Mode = mode
+	return Save(path, c)
 }

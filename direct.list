@@ -1,12 +1,12 @@
 ﻿# direct.list - hosts ALWAYS routed through the home network (never VPN).
-# Applies in BOTH modes. Edits take effect within ~1 second.
+# Applies in BOTH modes. Edits are watched by the active Windows routing service; existing sockets may reconnect.
 #
 # Entry shapes:
 #   localhost                 plain host
 #   *.github.com              wildcard host
 #   8.8.8.8                   IP
 #   192.168.0.0/16            CIDR
-#   https://api.example.com/v1/*   URL pattern
+#   https://api.example.com/v1/*   URL (routes the entire host)
 
 # === Loopback / link-local ===
 localhost

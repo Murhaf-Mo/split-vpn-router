@@ -18,27 +18,30 @@ import (
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+	Token   string
 }
 
 // Status mirrors the daemon's /api/status response.
 type Status struct {
-	Mode         string   `json:"mode"`
-	OcPid        int      `json:"oc_pid"`
-	TinyproxyPid int      `json:"tinyproxy_pid"`
-	PacPid       int      `json:"pac_pid"`
-	Tun0IP       string   `json:"tun0_ip"`
-	WSLIp        string   `json:"wsl_ip"`
-	ProxyPort    int      `json:"proxy_port"`
-	VPNList      ListInfo `json:"vpn_list"`
-	DirectList   ListInfo `json:"direct_list"`
+	Mode            string   `json:"mode"`
+	OcPid           int      `json:"oc_pid"`
+	RelayPid        int      `json:"relay_pid"`
+	DaemonPid       int      `json:"daemon_pid"`
+	Tun0IP          string   `json:"tun0_ip"`
+	ProxyHost       string   `json:"proxy_host"`
+	ConnectionState string   `json:"connection_state"`
+	Error           string   `json:"error"`
+	ProxyPort       int      `json:"proxy_port"`
+	VPNList         ListInfo `json:"vpn_list"`
+	DirectList      ListInfo `json:"direct_list"`
 }
 
 type ListInfo struct {
-	Domains     int     `json:"domains"`
-	Cidrs       int     `json:"cidrs"`
-	URLs        int     `json:"urls"`
-	Mtime       float64 `json:"mtime"`
-	LastReload  float64 `json:"last_reload"`
+	Domains    int     `json:"domains"`
+	Cidrs      int     `json:"cidrs"`
+	URLs       int     `json:"urls"`
+	Mtime      float64 `json:"mtime"`
+	LastReload float64 `json:"last_reload"`
 }
 
 type ListResponse struct {
@@ -98,6 +101,7 @@ func (c *Client) do(method, path string, body any, out any) error {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
@@ -135,7 +139,9 @@ func (c *Client) Status() (*Status, error) {
 // ---- Mode ----
 
 func (c *Client) GetMode() (string, error) {
-	var resp struct{ Mode string `json:"mode"` }
+	var resp struct {
+		Mode string `json:"mode"`
+	}
 	if err := c.do("GET", "/api/mode", nil, &resp); err != nil {
 		return "", err
 	}
@@ -189,9 +195,15 @@ func (c *Client) Reload() error {
 }
 
 func (c *Client) RestartOpenconnect() (*Status, error) {
-	var s Status
-	if err := c.do("POST", "/api/restart-openconnect", nil, &s); err != nil {
+	if err := c.Disconnect(); err != nil {
 		return nil, err
 	}
-	return &s, nil
+	return c.Connect()
 }
+
+func (c *Client) Connect() (*Status, error) {
+	var s Status
+	err := c.do("POST", "/api/connect", nil, &s)
+	return &s, err
+}
+func (c *Client) Disconnect() error { return c.do("POST", "/api/disconnect", nil, nil) }

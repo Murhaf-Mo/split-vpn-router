@@ -1,12 +1,15 @@
-# Files executed inside WSL/Linux must use LF, regardless of the
-# checkout-side core.autocrlf setting. Without this, Windows clones
-# with autocrlf=true convert these to CRLF and bash chokes on the \r.
-*.sh         text eol=lf
-*.py         text eol=lf
-vpn.list     text eol=lf
-direct.list  text eol=lf
-
-# Windows-side scripts keep CRLF.
-*.ps1  text eol=crlf
-*.cmd  text eol=crlf
-*.bat  text eol=crlf
+*.py text eol=lf
+*.go text eol=lf
+*.md text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sh text eol=lf
+vpn.list text eol=lf
+direct.list text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf

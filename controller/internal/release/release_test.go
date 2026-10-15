@@ -50,8 +50,8 @@ func TestIsNewer(t *testing.T) {
 
 func TestMSIDownloadURL(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"1.2.3", "https://github.com/Murhaf-Mo/wsl-vpn-router/releases/download/v1.2.3/wsl-vpn-router-1.2.3.msi"},
-		{"v1.2.3", "https://github.com/Murhaf-Mo/wsl-vpn-router/releases/download/v1.2.3/wsl-vpn-router-1.2.3.msi"},
+		{"1.2.3", "https://github.com/Murhaf-Mo/split-vpn-router/releases/download/v1.2.3/wsl-vpn-router-1.2.3.msi"},
+		{"v1.2.3", "https://github.com/Murhaf-Mo/split-vpn-router/releases/download/v1.2.3/wsl-vpn-router-1.2.3.msi"},
 	}
 	for _, c := range cases {
 		got := MSIDownloadURL(c.in)

@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!vpnctl.py
+!vpnc-script.py
+!static/
+!static/**

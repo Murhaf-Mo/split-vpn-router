@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/vpn/controller/internal/platform"
 	"github.com/vpn/controller/internal/release"
-	"github.com/vpn/controller/internal/wsl"
 )
 
 // Upgrade implements `vpn upgrade`.
@@ -35,6 +35,9 @@ import (
 func Upgrade(args []string) error {
 	local := release.LocalVersion()
 	fmt.Printf("current: %s\n", local)
+	if local == "dev" {
+		return fmt.Errorf("this is an unreleased development build; rebuild the checkout instead of replacing it with a published release")
+	}
 
 	remote, err := release.LatestVersion(context.Background())
 	if err != nil {
@@ -77,7 +80,7 @@ func Upgrade(args []string) error {
 
 	fmt.Println("launching installer (UAC will prompt) ...")
 	// /qb = basic UI with progress bar; /norestart = never silently reboot.
-	cmd := exec.Command(wsl.SysExe("msiexec.exe"), "/i", msiPath, "/qb", "/norestart")
+	cmd := exec.Command(platform.SysExe("msiexec.exe"), "/i", msiPath, "/qb", "/norestart")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: false}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting msiexec: %w", err)
@@ -110,8 +113,10 @@ func downloadTo(url, dst string) error {
 }
 
 // fetchExpectedSHA pulls the .sha256 sidecar. Format is one of:
-//   "<hex>"                       (bare hash)
-//   "<hex>  <filename>"           (shasum / sha256sum format)
+//
+//	"<hex>"                       (bare hash)
+//	"<hex>  <filename>"           (shasum / sha256sum format)
+//
 // Returns the hex digest.
 func fetchExpectedSHA(url string) (string, error) {
 	resp, err := http.Get(url)

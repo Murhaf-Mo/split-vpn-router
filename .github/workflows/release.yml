@@ -18,6 +18,19 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
+  test-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+      - run: docker build --platform linux/amd64 -t vpn-router-ci .
+      - run: python -m unittest discover -s tests -p test_container.py -v
+        env:
+          VPN_CONTAINER_IMAGE: vpn-router-ci
+
 
   # -------- Step 1: cross-compile Go binaries on linux --------
   build-binaries:
@@ -62,7 +75,7 @@ jobs:
 
       - name: Run release unit tests
         working-directory: controller
-        run: go test ./internal/release/...
+        run: go test ./internal/release/... ./internal/config/... ./internal/router/...
 
       - name: Upload binaries for the package job
         uses: actions/upload-artifact@v5
@@ -78,7 +91,7 @@ jobs:
   # to (June 2026). Pinning here avoids the deprecation notice.
   package-msi:
     runs-on: windows-2025
-    needs: build-binaries
+    needs: [build-binaries, test-runtime]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -87,6 +100,15 @@ jobs:
         id: ver
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: controller/go.sum
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
       - name: Download binaries from build-binaries
         uses: actions/download-artifact@v5
@@ -110,24 +132,38 @@ jobs:
       - name: Stage files for MSI build
         shell: pwsh
         run: |
-          # WiX's File@Source paths in wsl-vpn-router.wxs all derive from
+          # WiX's File@Source paths in split-vpn-router.wxs all derive from
           # $(var.StagingDir). Lay that out exactly here.
           $stage = "$PWD\installer\staging"
           New-Item -ItemType Directory -Force -Path "$stage\static" | Out-Null
           Copy-Item .\vpn.exe                 "$stage\vpn.exe"
           Copy-Item .\vpn-tray.exe            "$stage\vpn-tray.exe"
           Copy-Item .\vpnctl.py               "$stage\vpnctl.py"
-          Copy-Item .\setup-wsl.sh            "$stage\setup-wsl.sh"
+          Copy-Item .\Dockerfile, .\.dockerignore, .\vpnc-script.py, .\prepare-runtime.ps1 $stage
+          & .\prepare-runtime.ps1 -Destination $stage
           Copy-Item .\vpn.list                "$stage\vpn.list"
           Copy-Item .\direct.list             "$stage\direct.list"
           Copy-Item .\config.toml.example     "$stage\config.toml.example"
           Copy-Item .\uninstall.ps1           "$stage\uninstall.ps1"
-          Copy-Item .\wslprovision.ps1        "$stage\wslprovision.ps1"
           Copy-Item .\wsl-vpn-router.ico      "$stage\wsl-vpn-router.ico"
           Copy-Item .\static\index.html       "$stage\static\index.html"
           Copy-Item .\static\app.js           "$stage\static\app.js"
           Copy-Item .\static\style.css        "$stage\static\style.css"
           Get-ChildItem -Recurse $stage | Select-Object FullName, Length
+
+      - name: Native tests and generated-policy relay checks
+        shell: pwsh
+        run: |
+          $env:VPN_ROUTER_CONFIG_FIXTURE = "$env:RUNNER_TEMP\router-fixture.json"
+          $env:SING_BOX_BIN = "$PWD\installer\staging\sing-box.exe"
+          Push-Location controller
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Go tests failed' }
+          Pop-Location
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Python/relay tests failed' }
+          & $env:SING_BOX_BIN check -c $env:VPN_ROUTER_CONFIG_FIXTURE
+          if ($LASTEXITCODE -ne 0) { throw 'Native policy validation failed' }
 
       - name: Build MSI
         shell: pwsh
@@ -135,15 +171,9 @@ jobs:
           $ver  = "${{ steps.ver.outputs.version }}"
           $out  = "wsl-vpn-router-$ver.msi"
           $stage = "$PWD\installer\staging"
-          # Pin the util extension to the same major version as wix itself.
-          # Bare-name install pulls latest (v7.x → built for WiX v7) and fails
-          # at wix build time: "Could not find expected package root folder
-          # wixext6". /6.* wildcard is rejected with WIX0001 — only exact
-          # version is accepted by `wix extension add`.
-          wix extension add -g WixToolset.Util.wixext/6.0.0
-          wix build installer\wsl-vpn-router.wxs `
+          # This source uses core WiX elements and requires no extensions.
+          wix build installer\split-vpn-router.wxs `
               -arch x64 `
-              -ext WixToolset.Util.wixext `
               -d "Version=$ver" `
               -d "StagingDir=$stage" `
               -o $out

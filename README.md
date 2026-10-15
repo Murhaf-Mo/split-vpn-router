@@ -1,52 +1,60 @@
-# wsl-vpn-router
+# Split VPN Router
 
-Per-host VPN routing on Windows, powered by WSL.
+A Docker-contained OpenConnect VPN with a native Windows routing service.
 
-OpenConnect runs inside a WSL distro; its egress is exposed as an HTTP proxy; Windows' system proxy points at a PAC file that decides — per request URL — whether to send the traffic through the VPN or
-out your home network. Two plain-text lists (`vpn.list`, `direct.list`) plus a runtime-switchable default mode drive the split. Hot-reloaded, ~1s lag on edits.
+Put a domain, URL, IP or CIDR in `vpn.list` to send its connections through your VPN. `direct.list` selects your home network. The Windows virtual adapter handles TCP and UDP without requiring applications to understand PAC files or proxy environment variables. HTTP Git and SSH Git use the same policy.
 
-## Install
+The repository and checkout are named `split-vpn-router`. Historical Windows installation/data/registry names and MSI release asset filenames remain stable for upgrades. The tool no longer provisions, launches or modifies a WSL distro. Docker Desktop manages its own backend. If you also want WSL absent from Windows, choose a Docker backend supported by your Windows edition, such as Hyper-V. The installer leaves Docker's backend alone.
 
-From any PowerShell window:
+## Connection behavior
+
+- Installation, tray startup and container restart never log in to the VPN.
+- Up/Connect initiates one password authentication attempt.
+- `vpn.auto_reconnect = false` is the default. Timeouts and declined MFA leave the VPN disconnected.
+- Enabling reconnect permits transport recovery with the existing cookie only, never another password login.
+- While the routing service remains active, VPN-selected traffic fails when the VPN is unavailable; direct traffic remains direct.
+
+## Installation
+
+Requires Windows x64, Docker Desktop running Linux containers, and administrator approval for the routing service/virtual adapter. Docker alone cannot intercept Windows applications.
+
+The published installer is:
 
 ```powershell
-irm https://raw.githubusercontent.com/Murhaf-Mo/wsl-vpn-router/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Murhaf-Mo/split-vpn-router/main/install.ps1 | iex
 ```
 
-UAC prompts. MSI installs to `C:\Program Files\wsl-vpn-router\`. An interactive wizard collects your VPN host / user / password / group + WSL distro. The tunnel comes up. Tray icon appears.
+That URL installs the latest **published release**, not unreleased checkout changes. To build this checkout, use native Windows Go 1.25 or newer:
 
-Updates: the tray pings GitHub once a day and shows **↑ Update to X** when there's a newer release. Or run `vpn upgrade`. Or just re-run the irm one-liner.
+```powershell
+.\build.ps1
+.\vpn.exe configure
+.\vpn.exe up
+.\vpn.exe add https://internal.example.com
+.\vpn.exe dashboard
+.\vpn.exe down
+```
 
-## What this is
+The first Up requests UAC for the service, builds the contained runtime and explicitly initiates MFA. Configuration and logs stay outside the image. Changed image sources trigger a rebuild on the next start.
 
-A **split-routing** VPN client for developers who:
+Windows IP forwarding can cause a virtual-adapter routing loop. Up detects that conflict before authentication. Opt into `routing.manage_forwarding = true` to pause forwarding on the outbound adapter while routing and restore it on stop or crash; hotspot/machine forwarding may pause during the session. It is disabled by default.
 
-- need to reach a corporate network over OpenConnect (Cisco AnyConnect-compatible VPN),
-- want certain sites/apps to **not** route through that VPN (because it blocks them, slows them, or geo-locates them),
-- don't want to flip an "enable / disable VPN" toggle a hundred times a day.
+## Routing boundaries and migration
 
-If you just need an always-on, all-traffic VPN, the official Cisco AnyConnect client is simpler. This project exists for split-routing.
+URL inputs route the entire host. Encrypted HTTPS paths/query strings cannot be universal packet-routing rules. Existing sockets cannot move seamlessly between networks; policy replacement can reconnect them.
 
-## Documentation
+Domain routing uses intercepted DNS, Windows hosts-file mappings and protocol sniffing. Applications combining encrypted DNS with hidden hostnames, raw sockets or explicitly bound interfaces can need IP/CIDR rules or specific settings. This is not a guarantee that every possible network stack is intercepted.
 
-Everything lives under [`docs/`](docs/README.md):
+Before upgrading from the old release, stop it with its `vpn down`. The new controller backs up/removes recognized legacy PAC/environment/Git proxy settings. Apps already caching those settings may need one restart during migration. Unrelated proxies are preserved.
 
-| Topic                                   | Page                                               |
-|-----------------------------------------|----------------------------------------------------|
-| **Installing**                          | [docs/install.md](docs/install.md)                 |
-| **First-time setup**                    | [docs/quickstart.md](docs/quickstart.md)           |
-| **Daily CLI usage**                     | [docs/usage.md](docs/usage.md)                     |
-| **Routing lists**                       | [docs/lists.md](docs/lists.md)                     |
-| **Configuration schema**                | [docs/configuration.md](docs/configuration.md)     |
-| **How it works inside**                 | [docs/architecture.md](docs/architecture.md)       |
-| **Tray app**                            | [docs/tray.md](docs/tray.md)                       |
-| **Web dashboard**                       | [docs/dashboard.md](docs/dashboard.md)             |
-| **Updates**                             | [docs/updates.md](docs/updates.md)                 |
-| **Troubleshooting**                     | [docs/troubleshooting.md](docs/troubleshooting.md) |
-| **Security model**                      | [docs/security.md](docs/security.md)               |
-| **Uninstalling**                        | [docs/uninstall.md](docs/uninstall.md)             |
-| **Building from source / contributing** | [docs/development.md](docs/development.md)         |
+## Verification status
+
+Automated tests cover authentication/reconnect policy, configuration migration, API authorization, rule generation and legacy proxy recognition. The pinned engine validates generated configurations and exercises encrypted TCP/UDP transport. Docker startup, isolated IPv4/IPv6 route hooks, DNS preservation and passive restart passed.
+
+Live Windows checks on 2026-10-15 passed service installation/permissions, adapter startup, forwarding management/restoration after normal stop and forced termination, corporate MFA, public HTTPS/Git, corporate HTTPS, UDP corporate DNS, URL-rule reload without another login, and direct connectivity with VPN destinations blocked after disconnect. Browser/API dashboard checks passed without authentication. Sleep/resume, network switching and long session expiry still need separate testing; these results do not guarantee every application's network stack.
+
+See [documentation](docs/README.md), [architecture](docs/architecture.md) and [troubleshooting](docs/troubleshooting.md).
 
 ## License
 
-Personal-use. Fork freely.
+Personal-use. The separately executed sing-box engine includes its own bundled license; upstream source is at https://github.com/SagerNet/sing-box/tree/v1.14.3.
