@@ -24,11 +24,20 @@ def available_port():
 class ContainerTests(unittest.TestCase):
     def test_passive_start_route_isolation_and_restart(self):
         def docker(*args):
-            return subprocess.check_output(["docker", *args], text=True, stderr=subprocess.STDOUT).strip()
+            try:
+                return subprocess.check_output(["docker", *args], text=True, stderr=subprocess.STDOUT).strip()
+            except subprocess.CalledProcessError as error:
+                error.add_note(error.output)
+                raise
         with tempfile.TemporaryDirectory(prefix="vpn-router-container-test-") as directory:
             root = Path(directory)
             data, health = root / "data", root / "health"
             (data / "runtime").mkdir(parents=True)
+            # Linux bind mounts keep the host UID. This disposable fake-data
+            # directory must be writable by container root without DAC_OVERRIDE.
+            # Docker Desktop translates Windows ACLs, so it needs no adjustment.
+            if os.name == "posix":
+                (data / "runtime").chmod(0o777)
             health.mkdir()
             api_port, relay_port = available_port(), available_port()
             token = "a" * 64
