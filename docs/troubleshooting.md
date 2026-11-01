@@ -24,6 +24,16 @@ Use IP/CIDR rules for applications whose encrypted DNS and hidden hostnames prev
 
 Check IP forwarding on the outbound adapter. A live test reproduced self-captured router sockets when Ethernet forwarding was enabled, even in direct-default mode and with explicit interface binding. `routing.manage_forwarding = true` enables scoped, recoverable management of that setting; otherwise Up refuses the conflicting configuration before MFA. Do not globally disable forwarding on unrelated adapters. If startup fails, `vpn down` stops interception, and the independent recovery process restores recorded forwarding settings.
 
+## Forwarding recovery reports "Element not found"
+
+A saved forwarding entry can outlive an adapter or its IPv4/IPv6 configuration, for example after another VPN replaces an interface. Windows distinguishes an absent interface from other recovery errors in [GetIpInterfaceEntry](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getipinterfaceentry).
+
+Recovery retires confirmed missing interfaces/address families, restores the remaining interfaces, and removes the journal once complete. If a real read/write failure remains, only unfinished entries stay in the protected journal and the error identifies the interface LUID and address family. A missing-interface error during a write is checked again before being retired. Permission, storage and malformed-state errors remain visible; do not delete the recovery file to hide them.
+
+Recovery itself never authenticates. Preparing the service can repair stale state without connecting to the VPN.
+
+On 2026-11-01, the fixed native service recovered a real journal containing a removed adapter, activated routing through an already connected VPN, passed public HTTPS, and restored the complete IPv4/IPv6 forwarding baseline on normal stop. Regression tests cover missing adapters/families, disappearance during writes, partial progress, permission/storage errors and watchdog lease ownership. A corporate HTTPS check reached TLS but reported an expired server certificate. Forced termination was not repeated live in this validation.
+
 ## Config broken or Docker stopped
 
 `vpn down` works without valid configuration and removes interception before Docker cleanup. Complete service removal is `vpn router-uninstall` from an administrator terminal. OS DNS caches are flushed at adapter start/stop; apps holding their own synthetic DNS answers may need to re-resolve.

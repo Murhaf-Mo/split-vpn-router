@@ -708,6 +708,11 @@ func (h *handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 		finalError = err.Error()
 		return false, 1
 	}
+	// Repair an interrupted session before advertising readiness for a new login.
+	if err := recoverForwarding(); err != nil {
+		finalError = err.Error()
+		return false, 1
+	}
 	if err := CheckForwarding(cfg.ManageForwarding); err != nil {
 		writeStatus(false, err.Error())
 	} else {

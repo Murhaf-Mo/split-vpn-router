@@ -160,7 +160,13 @@ func readForwarding() ([]byte, error) {
 // Called only while holding forwarding.lock. A mismatched lease belongs to a
 // newer service instance and must never be restored by an older watchdog.
 func restoreForwarding(id string) error {
-	b, err := readForwarding()
+	return restoreForwardingJournal(id, readForwarding, saveForwarding, func() error { return os.Remove(forwardingPath()) }, restoreForwardingEntry)
+}
+
+// Complete every independent restoration, and retain only unfinished work. A
+// removed adapter/address family has no forwarding setting left to restore.
+func restoreForwardingJournal(id string, read func() ([]byte, error), save func(forwardingState) error, remove func() error, restore func(forwardingEntry) error) error {
+	b, err := read()
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -175,22 +181,64 @@ func restoreForwarding(id string) error {
 		return nil
 	}
 	var failures []error
+	var pending []forwardingEntry
 	for _, entry := range state.Entries {
-		row := windows.MibIpInterfaceRow{Family: entry.Family, InterfaceLuid: entry.LUID}
-		if err := windows.GetIpInterfaceEntry(&row); err != nil {
-			failures = append(failures, err)
-			continue
+		if err := restore(entry); err != nil {
+			pending = append(pending, entry)
+			failures = append(failures, fmt.Errorf("interface LUID %d family %d: %w", entry.LUID, entry.Family, err))
 		}
-		if row.ForwardingEnabled == 0 {
-			if err := setForwarding(&row, 1); err != nil {
-				failures = append(failures, err)
+	}
+	if len(pending) == 0 {
+		if err := remove(); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing completed forwarding recovery state: %w", err)
+		}
+		return nil
+	}
+	state.Entries = pending
+	if err := save(state); err != nil {
+		failures = append(failures, fmt.Errorf("saving unfinished forwarding recovery: %w", err))
+	}
+	return fmt.Errorf("restoring Windows forwarding: %w", errors.Join(failures...))
+}
+
+func missingForwardingInterface(err error) bool {
+	// GetIpInterfaceEntry documents FILE_NOT_FOUND for an absent LUID and
+	// NOT_FOUND when that interface no longer has the requested IP family.
+	return errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_NOT_FOUND)
+}
+
+func restoreForwardingEntry(entry forwardingEntry) error {
+	return restoreForwardingInterface(entry, windows.GetIpInterfaceEntry, setForwarding)
+}
+
+func restoreForwardingInterface(entry forwardingEntry, get func(*windows.MibIpInterfaceRow) error, set func(*windows.MibIpInterfaceRow, uint8) error) error {
+	if entry.LUID == 0 || (entry.Family != windows.AF_INET && entry.Family != windows.AF_INET6) {
+		return fmt.Errorf("invalid saved interface identity")
+	}
+	row := windows.MibIpInterfaceRow{Family: entry.Family, InterfaceLuid: entry.LUID}
+	if err := get(&row); err != nil {
+		if missingForwardingInterface(err) {
+			return nil
+		}
+		return err
+	}
+	if row.ForwardingEnabled != 0 {
+		return nil
+	}
+	if err := set(&row, 1); err != nil {
+		if missingForwardingInterface(err) {
+			// The adapter/family can disappear between lookup and restoration.
+			// Confirm its disappearance; do not hide a live interface's failure.
+			current := windows.MibIpInterfaceRow{Family: entry.Family, InterfaceLuid: entry.LUID}
+			if lookupErr := get(&current); missingForwardingInterface(lookupErr) {
+				return nil
+			} else if lookupErr != nil {
+				return errors.Join(err, fmt.Errorf("rechecking interface: %w", lookupErr))
 			}
 		}
+		return err
 	}
-	if err := errors.Join(failures...); err != nil {
-		return fmt.Errorf("restoring Windows forwarding: %w", err)
-	}
-	return os.Remove(forwardingPath())
+	return nil
 }
 
 func beginForwarding(manage bool) (*forwardingLease, error) {
